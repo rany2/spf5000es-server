@@ -1,0 +1,13 @@
+[MODBUS]
+PORT = /dev/ttyUSB0
+
+[WEB]
+ADDR = 0.0.0.0
+PORT = 8080
+KEEP_ALIVE = true
+TIMEOUT_SEC = 5
+X_FORWARDED_FOR = false
+
+USER = admin
+PASS_SALT = ca3d334694c2d59c60caffa9b17d848cd8a0c0fe  ; generate using `python3 hash_pass.py`
+PASS_HASH = 678b7a3f1877deb5b02e2ba6df960b9b053d2eda  ; generate using `python3 hash_pass.py`

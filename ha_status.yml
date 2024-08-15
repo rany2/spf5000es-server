@@ -1,0 +1,276 @@
+rest:
+  - resource: "http://192.168.1.2/status"
+    authentication: basic
+    username: "admin"
+    password: "admin"
+    sensor:
+      - name: "System Status"
+        value_template: "{{ value_json['SystemStatus'] }}"
+        unique_id: "growatt_system_status"
+      - name: "PV1 Volt"
+        value_template: "{{ value_json['PV1Volt'] }}"
+        device_class: voltage
+        unit_of_measurement: "V"
+        unique_id: "growatt_pv1_volt"
+      - name: "PV1 Watt"
+        value_template: "{{ value_json['PV1Watt'] }}"
+        device_class: power
+        unit_of_measurement: "W"
+        unique_id: "growatt_pv1_watt"
+      - name: "PV1 Amp"
+        value_template: "{{ value_json['PV1Amps'] }}"
+        device_class: current
+        unit_of_measurement: "A"
+        unique_id: "growatt_pv1_amp"
+      - name: "PV2 Volt"
+        value_template: "{{ value_json['PV2Volt'] }}"
+        device_class: voltage
+        unit_of_measurement: "V"
+        unique_id: "growatt_pv2_volt"
+      - name: "PV2 Watt"
+        value_template: "{{ value_json['PV2Watt'] }}"
+        device_class: power
+        unit_of_measurement: "W"
+        unique_id: "growatt_pv2_watt"
+      - name: "PV2 Amp"
+        value_template: "{{ value_json['PV2Amps'] }}"
+        device_class: current
+        unit_of_measurement: "A"
+        unique_id: "growatt_pv2_amp"
+      - name: "Output Watt"
+        value_template: "{{ value_json['OutputWatt'] }}"
+        device_class: power
+        unit_of_measurement: "W"
+        unique_id: "growatt_output_watt"
+      - name: "Output VA"
+        value_template: "{{ value_json['OutputVA'] }}"
+        device_class: apparent_power
+        unit_of_measurement: "VA"
+        unique_id: "growatt_output_va"
+      - name: "AC Charge Watt"
+        value_template: "{{ value_json['ACChrWatt'] }}"
+        device_class: power
+        unit_of_measurement: "W"
+        unique_id: "growatt_ac_charge_watt"
+      - name: "AC Charge VA"
+        value_template: "{{ value_json['ACChrVA'] }}"
+        device_class: apparent_power
+        unit_of_measurement: "VA"
+        unique_id: "growatt_ac_charge_va"
+      - name: "Battery Volt"
+        value_template: "{{ value_json['BatteryVolt'] }}"
+        device_class: voltage
+        unit_of_measurement: "V"
+        unique_id: "growatt_battery_volt"
+      - name: "Battery SOC"
+        value_template: "{{ value_json['BatterySOC'] }}"
+        device_class: battery
+        unit_of_measurement: "%"
+        unique_id: "growatt_battery_soc"
+      - name: "Bus Volt"
+        value_template: "{{ value_json['BusVolt'] }}"
+        device_class: voltage
+        unit_of_measurement: "V"
+        unique_id: "growatt_bus_volt"
+      - name: "Grid Volt"
+        value_template: "{{ value_json['GridVolt'] }}"
+        device_class: voltage
+        unit_of_measurement: "V"
+        unique_id: "growatt_grid_volt"
+      - name: "Line Frequency"
+        value_template: "{{ value_json['LineFreq'] }}"
+        device_class: frequency
+        unit_of_measurement: "Hz"
+        unique_id: "growatt_line_freq"
+      - name: "Output AC Volt"
+        value_template: "{{ value_json['OutputACVolt'] }}"
+        device_class: voltage
+        unit_of_measurement: "V"
+        unique_id: "growatt_output_ac_volt"
+      - name: "Output AC Freq"
+        value_template: "{{ value_json['OutputACFreq'] }}"
+        device_class: frequency
+        unit_of_measurement: "Hz"
+        unique_id: "growatt_output_ac_freq"
+      - name: "Output DC Volt"
+        value_template: "{{ value_json['OutputDCVolt'] }}"
+        device_class: voltage
+        unit_of_measurement: "V"
+        unique_id: "growatt_output_dc_volt"
+      - name: "Inverter Temp"
+        value_template: "{{ value_json['InvTempC'] }}"
+        device_class: temperature
+        unit_of_measurement: "°C"
+        unique_id: "growatt_inverter_temp"
+      - name: "DCDC Temp"
+        value_template: "{{ value_json['DCDCTempC'] }}"
+        device_class: temperature
+        unit_of_measurement: "°C"
+        unique_id: "growatt_dcdc_temp"
+      - name: "Load Percent"
+        value_template: "{{ value_json['LoadPercent'] }}"
+        device_class: power
+        unit_of_measurement: "%"
+        unique_id: "growatt_load_percent"
+      - name: "Battery Port Volt"
+        value_template: "{{ value_json['BatteryPortVolt'] }}"
+        device_class: voltage
+        unit_of_measurement: "V"
+        unique_id: "growatt_battery_port_volt"
+      - name: "Battery Bus Volt"
+        value_template: "{{ value_json['BatteryBusVolt'] }}"
+        device_class: voltage
+        unit_of_measurement: "V"
+        unique_id: "growatt_battery_bus_volt"
+      - name: "Buck 1 Temp"
+        value_template: "{{ value_json['Buck1TempC'] }}"
+        device_class: temperature
+        unit_of_measurement: "°C"
+        unique_id: "growatt_buck1_temp"
+      - name: "Buck 2 Temp"
+        value_template: "{{ value_json['Buck2TempC'] }}"
+        device_class: temperature
+        unit_of_measurement: "°C"
+        unique_id: "growatt_buck2_temp"
+      - name: "Output Amp"
+        value_template: "{{ value_json['OutputAmps'] }}"
+        device_class: current
+        unit_of_measurement: "A"
+        unique_id: "growatt_output_amp"
+      - name: "Inverter Amp"
+        value_template: "{{ value_json['InvAmps'] }}"
+        device_class: current
+        unit_of_measurement: "A"
+        unique_id: "growatt_inverter_amp"
+      - name: "AC Input Watt"
+        value_template: "{{ value_json['ACInputWatt'] }}"
+        device_class: power
+        unit_of_measurement: "W"
+        unique_id: "growatt_ac_input_watt"
+      - name: "AC Input VA"
+        value_template: "{{ value_json['ACInputVA'] }}"
+        device_class: apparent_power
+        unit_of_measurement: "VA"
+        unique_id: "growatt_ac_input_va"
+      # FaultBit -> DeviceTypeCode
+      - name: "Export to Grid Today"
+        value_template: "{{ value_json['ExportToGridTodaykWh'] }}"
+        device_class: energy
+        unit_of_measurement: "kWh"
+        unique_id: "growatt_export_to_grid_today"
+      - name: "Export to Grid Total"
+        value_template: "{{ value_json['ExportToGridTotalkWh'] }}"
+        device_class: energy
+        unit_of_measurement: "kWh"
+        unique_id: "growatt_export_to_grid_total"
+      - name: "PV1 Energy Today"
+        value_template: "{{ value_json['PV1EnergyTodaykWh'] }}"
+        device_class: energy
+        unit_of_measurement: "kWh"
+        unique_id: "growatt_pv1_energy_today"
+      - name: "PV1 Energy Total"
+        value_template: "{{ value_json['PV1EnergyTotalkWh'] }}"
+        device_class: energy
+        unit_of_measurement: "kWh"
+        unique_id: "growatt_pv1_energy_total"
+      - name: "PV2 Energy Today"
+        value_template: "{{ value_json['PV2EnergyTodaykWh'] }}"
+        device_class: energy
+        unit_of_measurement: "kWh"
+        unique_id: "growatt_pv2_energy_today"
+      - name: "PV2 Energy Total"
+        value_template: "{{ value_json['PV2EnergyTotalkWh'] }}"
+        device_class: energy
+        unit_of_measurement: "kWh"
+        unique_id: "growatt_pv2_energy_total"
+      - name: "AC Charge Energy Today"
+        value_template: "{{ value_json['ACChargeEnergyTodaykWh'] }}"
+        device_class: energy
+        unit_of_measurement: "kWh"
+        unique_id: "growatt_ac_charge_energy_today"
+      - name: "AC Charge Energy Total"
+        value_template: "{{ value_json['ACChargeEnergyTotalkWh'] }}"
+        device_class: energy
+        unit_of_measurement: "kWh"
+        unique_id: "growatt_ac_charge_energy_total"
+      - name: "Battery Discharge Energy Today"
+        value_template: "{{ value_json['BatteryDischargeEnergyTodaykWh'] }}"
+        device_class: energy
+        unit_of_measurement: "kWh"
+        unique_id: "growatt_battery_discharge_energy_today"
+      - name: "Battery Discharge Energy Total"
+        value_template: "{{ value_json['BatteryDischargeEnergyTotalkWh'] }}"
+        device_class: energy
+        unit_of_measurement: "kWh"
+        unique_id: "growatt_battery_discharge_energy_total"
+      - name: "AC Discharge Energy Today"
+        value_template: "{{ value_json['ACDischargeEnergyTodaykWh'] }}"
+        device_class: energy
+        unit_of_measurement: "kWh"
+        unique_id: "growatt_ac_discharge_energy_today"
+      - name: "AC Discharge Energy Total"
+        value_template: "{{ value_json['ACDischargeEnergyTotalkWh'] }}"
+        device_class: energy
+        unit_of_measurement: "kWh"
+        unique_id: "growatt_ac_discharge_energy_total"
+      - name: "AC Charge Battery Amp"
+        value_template: "{{ value_json['ACChargeBatteryAmps'] }}"
+        device_class: current
+        unit_of_measurement: "A"
+        unique_id: "growatt_ac_charge_battery_amp"
+      - name: "AC Discharge Watts"
+        value_template: "{{ value_json['ACDischargeWatt'] }}"
+        device_class: power
+        unit_of_measurement: "W"
+        unique_id: "growatt_ac_discharge_watt"
+      - name: "AC Discharge VA"
+        value_template: "{{ value_json['ACDischargeVA'] }}"
+        device_class: apparent_power
+        unit_of_measurement: "VA"
+        unique_id: "growatt_ac_discharge_va"
+      - name: "Battery Discharge Watts"
+        value_template: "{{ value_json['BatteryDischargeWatt'] }}"
+        device_class: power
+        unit_of_measurement: "W"
+        unique_id: "growatt_battery_discharge_watt"
+      - name: "Battery Discharge VA"
+        value_template: "{{ value_json['BatteryDischargeVA'] }}"
+        device_class: apparent_power
+        unit_of_measurement: "VA"
+        unique_id: "growatt_battery_discharge_va"
+      - name: "Battery Watts"
+        value_template: "{{ value_json['BatteryWatt'] }}"
+        device_class: power
+        unit_of_measurement: "W"
+        unique_id: "growatt_battery_watt"
+      - name: "MPPT Fan Speed"
+        value_template: "{{ value_json['MpptFanSpeedPercent'] }}"
+        device_class: speed
+        unit_of_measurement: "%"
+        unique_id: "growatt_mppt_fan_speed"
+      - name: "Inverter Fan Speed"
+        value_template: "{{ value_json['InvFanSpeedPercent'] }}"
+        device_class: speed
+        unit_of_measurement: "%"
+        unique_id: "growatt_inverter_fan_speed"
+      - name: "Total Charge Amp"
+        value_template: "{{ value_json['TotalChargeAmps'] }}"
+        device_class: current
+        unit_of_measurement: "A"
+        unique_id: "growatt_total_charge_amp"
+      - name: "Total Discharge Amp"
+        value_template: "{{ value_json['TotalDischargeAmps'] }}"
+        device_class: current
+        unit_of_measurement: "A"
+        unique_id: "growatt_total_discharge_amp"
+      - name: "OP Discharge Energy Today"
+        value_template: "{{ value_json['OPDischargeEnergyTodaykWh'] }}"
+        device_class: energy
+        unit_of_measurement: "kWh"
+        unique_id: "growatt_op_discharge_energy_today"
+      - name: "OP Discharge Energy Total"
+        value_template: "{{ value_json['OPDischargeEnergyTotalkWh'] }}"
+        device_class: energy
+        unit_of_measurement: "kWh"
+        unique_id: "growatt_op_discharge_energy_total"
+      # ParaSystemChargeAmps

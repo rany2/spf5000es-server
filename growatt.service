@@ -1,0 +1,15 @@
+[Unit]
+Description=Growatt Inverter
+After=network.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=/home/pi/growatt-monitor
+ExecStart=/usr/bin/python3 /home/pi/growatt-monitor/growatt.py
+Restart=always
+RestartSec=1
+User=pi
+
+[Install]
+WantedBy=multi-user.target

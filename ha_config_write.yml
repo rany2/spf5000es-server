@@ -1,0 +1,98 @@
+rest_command:
+  growatt_inverter:
+    url: "http://192.168.1.2/config?key={{key|urlencode}}&value={{value|urlencode}}"
+    method: put
+    username: "admin"
+    password: "admin"
+
+input_select:
+  grott_inverter_mode:
+    name: Growatt - Output Config
+    icon: mdi:power-plug-battery
+    options:
+      - "SBU"
+      - "SOL"
+      - "UTI"
+      - "SUB"
+  growatt_charge_config:
+    name: Growatt - Charge Config
+    icon: mdi:power-plug-battery
+    options:
+      - "PV First"
+      - "PV&UTI"
+      - "PV Only"
+
+input_number:
+  grott_uti_charge_current:
+    name: Growatt - Utility Charging Current
+    min: 0
+    max: 80
+    step: 5
+    unit_of_measurement: "A"
+    icon: mdi:transmission-tower-import
+    mode: box
+
+automation:
+  - alias: "Growatt - Set Output Config"
+    trigger:
+      platform: state
+      entity_id: input_select.grott_inverter_mode
+    action:
+      service: rest_command.growatt_inverter
+      data_template:
+        key: "OutputConfig"
+        value: "{{ states('input_select.grott_inverter_mode') }}"
+  - alias: "Growatt - Set Utility Charging Current"
+    trigger:
+      platform: state
+      entity_id: input_number.grott_uti_charge_current
+    action:
+      service: rest_command.growatt_inverter
+      data_template:
+        key: "ACChargeAmps"
+        value: "{{ states('input_number.grott_uti_charge_current') }}"
+  - alias: "Growatt - Update Output Config"
+    trigger:
+      platform: state
+      entity_id: sensor.output_config
+      not_to:
+        - "unknown"
+        - "unavailable"
+    action:
+      service: input_select.select_option
+      data_template:
+        entity_id: input_select.grott_inverter_mode
+        option: "{{ states('sensor.output_config') }}"
+  - alias: "Growatt - Update Utility Charging Current"
+    trigger:
+      platform: state
+      entity_id: sensor.ac_charge_amps
+      not_to:
+        - "unknown"
+        - "unavailable"
+    action:
+      service: input_number.set_value
+      data_template:
+        entity_id: input_number.grott_uti_charge_current
+        value: "{{ states('sensor.ac_charge_amps') }}"
+  - alias: "Growatt - Set Charge Config"
+    trigger:
+      platform: state
+      entity_id: input_select.growatt_charge_config
+    action:
+      service: rest_command.growatt_inverter
+      data_template:
+        key: "ChargeConfig"
+        value: "{{ states('input_select.growatt_charge_config') }}"
+  - alias: "Growatt - Update Charge Config"
+    trigger:
+      platform: state
+      entity_id: sensor.charge_config
+      not_to:
+        - "unknown"
+        - "unavailable"
+    action:
+      service: input_select.select_option
+      data_template:
+        entity_id: input_select.growatt_charge_config
+        option: "{{ states('sensor.charge_config') }}"

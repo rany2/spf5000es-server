@@ -1,0 +1,13 @@
+version: '3.3'
+services:
+    spf5000es-server:
+        image: ghcr.io/rany2/spf5000es-server:master
+        container_name: spf5000es-server
+        restart: unless-stopped
+        ports:
+            - "8000:8000"
+        volumes:
+            - config.ini:/app/config.ini
+        privileged: true
+        devices:
+            - /dev/ttyUSB0:/dev/ttyUSB0
