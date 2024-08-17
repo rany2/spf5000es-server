@@ -302,8 +302,9 @@ CONTENT_TYPE_TEXT = "text/plain; charset=utf-8"
 CONTENT_TYPE_HTML = "text/html; charset=utf-8"
 
 
-class ThreadSafeModbusClient:
-    """Modbus RTU client with lock for thread safety.
+class GrowattModbusClient:
+    """Modbus RTU client with lock that adheares to Growatt specifications in terms
+    of waiting time between requests when necessary.
 
     pymodbus is not thread-safe, so we need to use a lock to prevent concurrent access.
     Source: https://pymodbus.readthedocs.io/en/v3.7.0/source/client.html"""
@@ -325,55 +326,97 @@ class ThreadSafeModbusClient:
         self.lock = Lock()
 
     @staticmethod
-    def lock_wrapper(func):
-        """Decorator to lock the function call."""
+    def lock_wrapper(enforce_wait_time: bool):
+        """Decorator factory to lock the function call.
 
-        def wrapper(self: "ThreadSafeModbusClient", *args, **kwargs):
-            with self.lock:
-                return func(self, *args, **kwargs)
+        Args:
+            enforce_wait_time (bool): Whether to enforce the minimum wait time of 850ms.
+        """
 
-        return wrapper
+        def _lock_wrapper(func):
+            """Decorator to lock the function call."""
 
-    @lock_wrapper
+            def wrapper(self: "GrowattModbusClient", *args, **kwargs):
+                """Wrapper function to lock the function call."""
+
+                def wait_and_release():
+                    """Release the lock after the minimum wait time."""
+
+                    # Wait for minimum 850ms per Growatt Modbus documentation
+                    sleep(0.85)
+
+                    # Release the lock after waiting for the minimum time
+                    self.lock.release()
+
+                try:
+                    # Acquire the lock before calling the function
+                    self.lock.acquire()
+
+                    # Call the function with the lock acquired
+                    return func(self, *args, **kwargs)
+                finally:
+                    if enforce_wait_time:
+                        # Release the lock after the function call
+                        # while enforcing the minimum wait time.
+                        try:
+                            # Start a new thread to wait and release the lock
+                            # to prevent blocking the request handler.
+                            Thread(target=wait_and_release).start()
+                        except Exception as exc:  # pylint: disable=broad-except
+                            # Print the exception to stderr.
+                            sys.stderr.write(f"[ERROR] {exc}\n")
+
+                            # If we can't start a new thread, just wait and release.
+                            # This might happen when we run out of resources.
+                            wait_and_release()
+                    else:
+                        # Release the lock after the function call
+                        self.lock.release()
+
+            return wrapper
+
+        return _lock_wrapper
+
+    @lock_wrapper(enforce_wait_time=False)
     @override
     def connect(self):
         """Connect to the Modbus server."""
         self.client.connect()
 
-    @lock_wrapper
+    @lock_wrapper(enforce_wait_time=False)
     @override
     def close(self):
         """Close the connection to the Modbus server."""
         self.client.close()
 
-    @lock_wrapper
+    @lock_wrapper(enforce_wait_time=False)
     @override
     def read_input_registers(self, start: int, count: int):
         """Read input registers from the Modbus server."""
         return self.client.read_input_registers(start, count)
 
-    @lock_wrapper
+    @lock_wrapper(enforce_wait_time=False)
     @override
     def read_holding_registers(self, start: int, count: int = 1):
         """Read holding registers from the Modbus server."""
         return self.client.read_holding_registers(start, count)
 
-    @lock_wrapper
+    @lock_wrapper(enforce_wait_time=True)
     @override
     def write_registers(self, address: int, values: int):
         """Write multiple registers to the Modbus server."""
         return self.client.write_registers(address, values)
 
 
-class GrowattModbus:
+class GrowattInverter:
     """Class to interact with a Growatt inverter using Modbus RTU."""
 
     def __init__(self, port: str):
-        """Initialize the GrowattModbus instance.
+        """Initialize the Growatt inverter.
 
         Args:
             port (str): The serial port to use (e.g. "/dev/ttyUSB0")."""
-        self.client = ThreadSafeModbusClient(port)
+        self.client = GrowattModbusClient(port)
         self.datetime_thread = Thread(target=self.update_datetime)
         self.datetime_running = None
 
@@ -392,8 +435,8 @@ class GrowattModbus:
             self.datetime_thread.join()
 
     def update_datetime(self):
-        """Update the inverter's datetime every 10 seconds."""
-        update_interval, sleep_time = 10, 0.5
+        """Update the inverter's datetime every 64 seconds."""
+        update_interval, sleep_time = 64, 0.5
         timer = 0  # update immediately in the first iteration
         while self.datetime_running:
             if timer >= 0:
@@ -456,7 +499,7 @@ class GrowattModbus:
             start (int): The start index of the registers.
             length (int): The number of registers to combine.
             signed (bool): Whether the value is signed."""
-        data = GrowattModbus.registers_to_bytes(registers, start, length)
+        data = GrowattInverter.registers_to_bytes(registers, start, length)
         return int.from_bytes(data, "big", signed=signed)
 
     @staticmethod
@@ -467,7 +510,7 @@ class GrowattModbus:
             value (int): The value to uncombine.
             length (int): The number of registers to uncombine to."""
         data = value.to_bytes(length * 2, "big", signed=True)
-        return GrowattModbus.bytes_to_registers(data)
+        return GrowattInverter.bytes_to_registers(data)
 
     @staticmethod
     def registers_to_char(registers: List[int], start: int = 0, length: int = 1) -> str:
@@ -477,7 +520,7 @@ class GrowattModbus:
             registers (List[int]): The registers to convert.
             start (int): The start index of the registers.
             length (int): The number of registers to convert."""
-        data = GrowattModbus.registers_to_bytes(registers, start, length)
+        data = GrowattInverter.registers_to_bytes(registers, start, length)
         return data.decode("utf-8")
 
     @staticmethod
@@ -493,11 +536,11 @@ class GrowattModbus:
             type_ (RegType): The register type."""
         match type_:
             case RegType.UINT | RegType.INT:
-                return GrowattModbus.combine_registers(
+                return GrowattInverter.combine_registers(
                     registers, start, length, signed=type_ == RegType.INT
                 )
             case RegType.CHAR:
-                return GrowattModbus.registers_to_char(registers, start, length)
+                return GrowattInverter.registers_to_char(registers, start, length)
             case _:
                 raise ValueError("Invalid register type")
 
@@ -581,7 +624,7 @@ class GrowattHTTPHandler(BaseHTTPRequestHandler):
 
     def __init__(
         self,
-        inverter: GrowattModbus,
+        inverter: GrowattInverter,
         timeout: int,
         x_forwarded_for: bool,
         auth: GrowattHTTPAuth,
@@ -591,7 +634,7 @@ class GrowattHTTPHandler(BaseHTTPRequestHandler):
         """Initialize the handler.
 
         Args:
-            inverter (GrowattModbus): The GrowattModbus instance to use.
+            inverter (GrowattInverter): The Growatt inverter.
             timeout (int): The timeout in seconds for the request.
             x_forwarded_for (bool): Whether to use the X-Forwarded-For header.
             auth (GrowattHTTPAuth): The authentication data.
@@ -869,7 +912,7 @@ class GrowattHTTPHandler(BaseHTTPRequestHandler):
 
 def growatt_http_handler_factory(
     *,
-    inverter: GrowattModbus,
+    inverter: GrowattInverter,
     timeout: int,
     x_forwarded_for: bool,
     auth: GrowattHTTPAuth,
@@ -877,7 +920,7 @@ def growatt_http_handler_factory(
     """Factory function to create a GrowattHTTPHandler instance.
 
     Args:
-        inverter (GrowattModbus): The GrowattModbus instance to use.
+        inverter (GrowattInverter): The Growatt inverter.
         timeout (int): The timeout in seconds for the request.
         x_forwarded_for (bool): Whether to use the X-Forwarded-For header.
         auth (GrowattHTTPAuth): The authentication dataclass."""
@@ -888,7 +931,7 @@ def growatt_http_handler_factory(
 
 def main():
     """Main function."""
-    inverter: Optional[GrowattModbus] = None
+    inverter: Optional[GrowattInverter] = None
     http_server: Optional[HTTPServer] = None
     try:
         cfg = configparser.ConfigParser()
@@ -904,7 +947,7 @@ def main():
 
         sys.stderr.write(f"[INFO] Inverter port set to {modbus_port}\n")
         sys.stderr.write(f"[INFO] HTTP Server listening on {web_addr}:{web_port}\n")
-        inverter = GrowattModbus(modbus_port)
+        inverter = GrowattInverter(modbus_port)
         http_handler = growatt_http_handler_factory(
             inverter=inverter,
             timeout=web_timeout,
