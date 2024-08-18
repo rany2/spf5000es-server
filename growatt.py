@@ -503,13 +503,14 @@ class GrowattInverter:
         return int.from_bytes(data, "big", signed=signed)
 
     @staticmethod
-    def uncombine_registers(value: int, length: int) -> List[int]:
+    def uncombine_registers(value: int, length: int, signed: bool = False) -> List[int]:
         """Uncombine a single value into multiple registers.
 
         Args:
             value (int): The value to uncombine.
-            length (int): The number of registers to uncombine to."""
-        data = value.to_bytes(length * 2, "big", signed=True)
+            length (int): The number of registers to uncombine to.
+            signed (bool): Whether the value is signed."""
+        data = value.to_bytes(length * 2, "big", signed=signed)
         return GrowattInverter.bytes_to_registers(data)
 
     @staticmethod
@@ -589,7 +590,7 @@ class GrowattInverter:
 
         match type_:
             case RegType.UINT | RegType.INT:
-                values = self.uncombine_registers(value, length)
+                values = self.uncombine_registers(value, length, signed=type_ == RegType.INT)
             case RegType.CHAR:
                 values = list(value.encode("utf-8"))
                 values = [
