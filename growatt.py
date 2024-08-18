@@ -692,7 +692,7 @@ class GrowattHTTPHandler(BaseHTTPRequestHandler):
             self.send_header(key, value)
         self.send_header("Content-Length", str(len(body)))
         if "Connection" not in headers:
-            self.send_header("Connection", "keep-alive")
+            self.send_header("Connection", "close")
         self.end_headers()
         if body and self.command != "HEAD":
             self.wfile.write(body)
