@@ -15,7 +15,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler
 from http.server import ThreadingHTTPServer as HTTPServer
 from json import dumps as json_dumps
-from threading import Lock, Thread
+from threading import Event, Lock, Thread
 from time import sleep
 from typing import Dict, List, Optional, Union, override
 from urllib.parse import parse_qs
@@ -417,33 +417,26 @@ class GrowattInverter:
         Args:
             port (str): The serial port to use (e.g. "/dev/ttyUSB0")."""
         self.client = GrowattModbusClient(port)
-        self.datetime_thread = Thread(target=self.update_datetime)
-        self.datetime_running = None
+        self.sync_time_thread = Thread(target=self.sync_time)
+        self.sync_time_event = Event()
 
     def connect(self):
         """Connect to the Modbus server and start the datetime thread."""
         self.client.connect()
-        self.datetime_running = True
-        if not self.datetime_thread.is_alive():
-            self.datetime_thread.start()
+        if not self.sync_time_thread.is_alive():
+            self.sync_time_thread.start()
 
     def close(self):
         """Close the connection to the Modbus server and stop the datetime thread."""
         self.client.close()
-        self.datetime_running = False
-        if self.datetime_thread.is_alive():
-            self.datetime_thread.join()
+        self.sync_time_event.set()
+        if self.sync_time_thread.is_alive():
+            self.sync_time_thread.join()
 
-    def update_datetime(self):
-        """Update the inverter's datetime every 64 seconds."""
-        update_interval, sleep_time = 64, 0.5
-        timer = 0  # update immediately in the first iteration
-        while self.datetime_running:
-            if timer >= 0:
-                sleep(sleep_time)
-                timer -= sleep_time
-                continue
-            timer = update_interval  # set timer for next update
+    def sync_time(self):
+        """Update the inverter's time every 64 seconds."""
+        update_interval = 64  # seconds
+        while True:
             now = datetime.now()
             values = [
                 now.year,  # SysYear (45)
@@ -460,6 +453,9 @@ class GrowattInverter:
                 )
             except Exception as exc:  # pylint: disable=broad-except
                 sys.stderr.write(f"[ERROR] Failed to update time: {exc}\n")
+
+            if self.sync_time_event.wait(timeout=update_interval):
+                break
 
     @staticmethod
     def registers_to_bytes(
@@ -590,7 +586,9 @@ class GrowattInverter:
 
         match type_:
             case RegType.UINT | RegType.INT:
-                values = self.uncombine_registers(value, length, signed=type_ == RegType.INT)
+                values = self.uncombine_registers(
+                    value, length, signed=type_ == RegType.INT
+                )
             case RegType.CHAR:
                 values = list(value.encode("utf-8"))
                 values = [
