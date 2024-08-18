@@ -5,7 +5,7 @@ PORT = /dev/ttyUSB0
 ADDR = 0.0.0.0
 PORT = 8080
 KEEP_ALIVE = true
-TIMEOUT_SEC = 5
+TIMEOUT_SEC = 10
 X_FORWARDED_FOR = false
 
 USER = admin
