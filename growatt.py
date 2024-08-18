@@ -309,6 +309,8 @@ class GrowattModbusClient:
     pymodbus is not thread-safe, so we need to use a lock to prevent concurrent access.
     Source: https://pymodbus.readthedocs.io/en/v3.7.0/source/client.html"""
 
+    MIN_WAIT_TIME_BETWEEN_CMDS = 0.85  # seconds
+
     def __init__(self, port: str):
         """
         Args:
@@ -342,8 +344,8 @@ class GrowattModbusClient:
                 def wait_and_release():
                     """Release the lock after the minimum wait time."""
 
-                    # Wait for minimum 850ms per Growatt Modbus documentation
-                    sleep(0.85)
+                    # Wait for the minimum per Growatt Modbus documentation
+                    sleep(self.MIN_WAIT_TIME_BETWEEN_CMDS)
 
                     # Release the lock after waiting for the minimum time
                     self.lock.release()
@@ -401,11 +403,20 @@ class GrowattModbusClient:
         """Read holding registers from the Modbus server."""
         return self.client.read_holding_registers(start, count)
 
+    def write_registers_unsafe(self, address: int, values: int):
+        """Write multiple registers to the Modbus server without
+        holding the lock or enforcing the wait time.
+
+        This is useful when the operation is time-sensitive and
+        we want to ensure that the value is written as soon as
+        possible. This is useful for setting the inverter's time."""
+        return self.client.write_registers(address, values)
+
     @lock_wrapper(enforce_wait_time=True)
     @override
     def write_registers(self, address: int, values: int):
         """Write multiple registers to the Modbus server."""
-        return self.client.write_registers(address, values)
+        return self.write_registers_unsafe(address, values)
 
 
 class GrowattInverter:
@@ -437,22 +448,26 @@ class GrowattInverter:
         """Update the inverter's time every 64 seconds."""
         update_interval = 64  # seconds
         while True:
-            now = datetime.now()
-            values = [
-                now.year,  # SysYear (45)
-                now.month,  # SysMonth (46)
-                now.day,  # SysDay (47)
-                now.hour,  # SysHour (48)
-                now.minute,  # SysMin (49)
-                now.second,  # SysSec (50)
-            ]
             try:
-                self.client.write_registers(
+                self.client.lock.acquire()  # pylint: disable=consider-using-with
+                now = datetime.now()
+                values = [
+                    now.year,  # SysYear (45)
+                    now.month,  # SysMonth (46)
+                    now.day,  # SysDay (47)
+                    now.hour,  # SysHour (48)
+                    now.minute,  # SysMin (49)
+                    now.second,  # SysSec (50)
+                ]
+                self.client.write_registers_unsafe(
                     HoldingAndWriteRegisters["SysYear"][0],  # 45
                     values=values,  # [year, month, day, hour, minute, second]
                 )
             except Exception as exc:  # pylint: disable=broad-except
                 sys.stderr.write(f"[ERROR] Failed to update time: {exc}\n")
+            finally:
+                sleep(self.client.MIN_WAIT_TIME_BETWEEN_CMDS)
+                self.client.lock.release()
 
             if self.sync_time_event.wait(timeout=update_interval):
                 break
