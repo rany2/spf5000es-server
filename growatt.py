@@ -380,25 +380,21 @@ class GrowattModbusClient:
         return _lock_wrapper
 
     @lock_wrapper(enforce_wait_time=False)
-    @override
     def connect(self):
         """Connect to the Modbus server."""
         self.client.connect()
 
     @lock_wrapper(enforce_wait_time=False)
-    @override
     def close(self):
         """Close the connection to the Modbus server."""
         self.client.close()
 
     @lock_wrapper(enforce_wait_time=False)
-    @override
     def read_input_registers(self, start: int, count: int):
         """Read input registers from the Modbus server."""
         return self.client.read_input_registers(start, count)
 
     @lock_wrapper(enforce_wait_time=False)
-    @override
     def read_holding_registers(self, start: int, count: int = 1):
         """Read holding registers from the Modbus server."""
         return self.client.read_holding_registers(start, count)
@@ -413,7 +409,6 @@ class GrowattModbusClient:
         return self.client.write_registers(address, values)
 
     @lock_wrapper(enforce_wait_time=True)
-    @override
     def write_registers(self, address: int, values: int):
         """Write multiple registers to the Modbus server."""
         return self.write_registers_unsafe(address, values)
