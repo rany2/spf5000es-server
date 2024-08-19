@@ -16,7 +16,7 @@ from http.server import BaseHTTPRequestHandler
 from http.server import ThreadingHTTPServer as HTTPServer
 from json import dumps as json_dumps
 from threading import Event, Lock, Thread
-from time import sleep
+from time import sleep, time
 from typing import Dict, List, Optional, Union, override
 from urllib.parse import parse_qs
 
@@ -450,6 +450,7 @@ class GrowattInverter:
         while True:
             try:
                 self.client.lock.acquire()  # pylint: disable=consider-using-with
+                sleep(int(time() + 1) - time())  # Wait until the next exact second
                 now = datetime.now()
                 values = [
                     now.year,  # SysYear (45)
