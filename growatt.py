@@ -445,8 +445,8 @@ class GrowattInverter:
             self.sync_time_thread.join()
 
     def sync_time(self):
-        """Update the inverter's time every 64 seconds."""
-        update_interval = 64  # seconds
+        """Update the inverter's time every 720 seconds."""
+        update_interval = 720  # seconds
         while True:
             try:
                 self.client.lock.acquire()  # pylint: disable=consider-using-with
