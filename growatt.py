@@ -196,7 +196,7 @@ HoldingAndWriteRegisters = {
                         lambda x: OverLoadRestartW[x]),
     "OverTempRestart": (21, 1, RegType.UINT,
                         lambda x: OverTempRestartR[x],
-                        lambda x: OverTempRestartW[x]),
+                        lambda x: OverTempRestartW[str2bool(x)]),
     "BuzzerEnable": (22, 1, RegType.UINT, bool, str2bool2int),
     "SerialNumber": (23, 5, RegType.CHAR, str, int),
     "MoudleH": (28, 1, RegType.UINT, int, int),
