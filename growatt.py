@@ -271,39 +271,6 @@ HoldingAndWriteRegisters = {
 }
 
 
-def get_all_regno_for_key(
-    registers: Dict[str, Tuple[int, int, RegType, callable, Optional[callable]]],
-    key: str,
-) -> List[int]:
-    """Get all register numbers for a key."""
-    start, length, *_ = registers[key]
-    return list(range(start, start + length))
-
-
-WriteRegistersForbiddenBatch = {
-    *get_all_regno_for_key(HoldingAndWriteRegisters, "OutputVoltType"),
-    *get_all_regno_for_key(HoldingAndWriteRegisters, "OutputFreqType"),
-    *get_all_regno_for_key(HoldingAndWriteRegisters, "SysYear"),
-    *get_all_regno_for_key(HoldingAndWriteRegisters, "SysMonth"),
-    *get_all_regno_for_key(HoldingAndWriteRegisters, "SysDay"),
-    *get_all_regno_for_key(HoldingAndWriteRegisters, "SysHour"),
-    *get_all_regno_for_key(HoldingAndWriteRegisters, "SysMin"),
-    *get_all_regno_for_key(HoldingAndWriteRegisters, "SysSec"),
-}
-
-
-def get_all_known_writeable_regno():
-    """Get all known writeable register numbers."""
-    ret = []
-    for _, (start, length, _, _, write) in HoldingAndWriteRegisters.items():
-        if write is not None:
-            ret.extend(list(range(start, start + length)))
-    return ret
-
-
-WriteRegistersBatchable = get_all_known_writeable_regno()
-
-
 def generate_index_html():
     """Generates the index HTML page."""
     index_html = (
@@ -525,60 +492,11 @@ class GrowattInverter:
                 for i in range(len(values)):
                     requested[start + i] = values[i]
 
-            if not requested:
-                continue
-
-            try:
-                # Acquire the lock to write the registers
-                self.client.lock.acquire()  # pylint: disable=consider-using-with
-
-                # Read all registers
-                row1 = self.client.read_holding_registers_unsafe(0, 101)  # 0-100
-                row2 = self.client.read_holding_registers_unsafe(101, 62)  # 101-162
-                reg = row1.registers + row2.registers
-                assert len(reg) == 163
-
-                # Update the registers to set the new values
-                forbidden = {*WriteRegistersForbiddenBatch}  # copy
-                for regno, value in requested.items():
-                    reg[regno] = value
-                    forbidden.discard(regno)
-
-                # Split the registers into two ranges
-                ranges = [
-                    (0, reg[:101]),  # 0-100
-                    (101, reg[101:]),  # 101-162
-                ]
-
-                # Remove forbidden/unknown registers from the ranges
-                new_ranges = []
-                for start, values in ranges:
-                    new_values = []
-                    new_start = start
-                    for i, value in enumerate(values):
-                        if (
-                            start + i in forbidden
-                            or start + i not in WriteRegistersBatchable
-                        ):
-                            if new_values:
-                                new_ranges.append((new_start, new_values))
-                                new_values = []
-                            new_start = start + i + 1
-                        else:
-                            new_values.append(value)
-                    if new_values:
-                        new_ranges.append((new_start, new_values))
-                ranges = new_ranges
-
-                # Write the registers in batches for ranges where we have values to set
-                for start, values in ranges:
-                    if any(i in requested for i in range(start, start + len(values))):
-                        self.client.write_registers_unsafe(start, values)
-                        sleep(self.client.MIN_WAIT_TIME_BETWEEN_CMDS)
-            except Exception as exc:  # pylint: disable=broad-except
-                sys.stderr.write(f"[ERROR] Failed to write register: {exc}\n")
-            finally:
-                self.client.lock.release()
+            for start, values in requested.items():
+                try:
+                    self.client.write_registers(start, values)
+                except Exception as exc:
+                    sys.stderr.write(f"[ERROR] Failed to write registers: {exc}\n")
 
     @staticmethod
     def registers_to_bytes(
@@ -690,8 +608,7 @@ class GrowattInverter:
         return info
 
     def write_config(self, key: str, value: Union[str, int, float]):
-        """Schedule a config write to the inverter to be processed by
-        the write thread in batches.
+        """Schedule a config write to the inverter to be processed by the write thread.
 
         Args:
             key (str): The configuration key to write.
