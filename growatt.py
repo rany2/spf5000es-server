@@ -2,6 +2,8 @@
 
 """Allows to read and write data from Growatt inverters using Modbus RTU over RS485."""
 
+# pylint: disable=too-many-lines
+
 import base64
 import binascii
 import configparser
@@ -18,7 +20,7 @@ from json import dumps as json_dumps
 from queue import Queue
 from threading import Event, Lock, Thread
 from time import sleep, time
-from typing import Dict, List, Optional, Tuple, Union, override
+from typing import Dict, List, Optional, Union, override
 from urllib.parse import parse_qs
 
 from pymodbus.client import ModbusSerialClient as ModbusClient
@@ -489,13 +491,13 @@ class GrowattInverter:
             requested = {}
             while not self.write_queue.empty():
                 start, values = self.write_queue.get_nowait()
-                for i in range(len(values)):
-                    requested[start + i] = values[i]
+                for i, value in enumerate(values):
+                    requested[start + i] = value
 
             for start, values in requested.items():
                 try:
                     self.client.write_registers(start, values)
-                except Exception as exc:
+                except Exception as exc:  # pylint: disable=broad-except
                     sys.stderr.write(f"[ERROR] Failed to write registers: {exc}\n")
 
     @staticmethod
