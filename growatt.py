@@ -15,9 +15,10 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler
 from http.server import ThreadingHTTPServer as HTTPServer
 from json import dumps as json_dumps
+from queue import Queue
 from threading import Event, Lock, Thread
 from time import sleep, time
-from typing import Dict, List, Optional, Union, override
+from typing import Dict, List, Optional, Tuple, Union, override
 from urllib.parse import parse_qs
 
 from pymodbus.client import ModbusSerialClient as ModbusClient
@@ -198,7 +199,7 @@ HoldingAndWriteRegisters = {
                         lambda x: OverTempRestartR[x],
                         lambda x: OverTempRestartW[str2bool(x)]),
     "BuzzerEnable": (22, 1, RegType.UINT, bool, str2bool2int),
-    "SerialNumber": (23, 5, RegType.CHAR, str, int),
+    "SerialNumber": (23, 5, RegType.CHAR, str, str),
     "MoudleH": (28, 1, RegType.UINT, int, int),
     "MoudleL": (29, 1, RegType.UINT, int, int),
     "ComAddress": (30, 1, RegType.UINT, int, int),
@@ -270,6 +271,39 @@ HoldingAndWriteRegisters = {
 }
 
 
+def get_all_regno_for_key(
+    registers: Dict[str, Tuple[int, int, RegType, callable, Optional[callable]]],
+    key: str,
+) -> List[int]:
+    """Get all register numbers for a key."""
+    start, length, *_ = registers[key]
+    return list(range(start, start + length))
+
+
+WriteRegistersForbiddenBatch = {
+    *get_all_regno_for_key(HoldingAndWriteRegisters, "OutputVoltType"),
+    *get_all_regno_for_key(HoldingAndWriteRegisters, "OutputFreqType"),
+    *get_all_regno_for_key(HoldingAndWriteRegisters, "SysYear"),
+    *get_all_regno_for_key(HoldingAndWriteRegisters, "SysMonth"),
+    *get_all_regno_for_key(HoldingAndWriteRegisters, "SysDay"),
+    *get_all_regno_for_key(HoldingAndWriteRegisters, "SysHour"),
+    *get_all_regno_for_key(HoldingAndWriteRegisters, "SysMin"),
+    *get_all_regno_for_key(HoldingAndWriteRegisters, "SysSec"),
+}
+
+
+def get_all_known_writeable_regno():
+    """Get all known writeable register numbers."""
+    ret = []
+    for _, (start, length, _, _, write) in HoldingAndWriteRegisters.items():
+        if write is not None:
+            ret.extend(list(range(start, start + length)))
+    return ret
+
+
+WriteRegistersBatchable = get_all_known_writeable_regno()
+
+
 def generate_index_html():
     """Generates the index HTML page."""
     index_html = (
@@ -309,7 +343,7 @@ class GrowattModbusClient:
     pymodbus is not thread-safe, so we need to use a lock to prevent concurrent access.
     Source: https://pymodbus.readthedocs.io/en/v3.7.0/source/client.html"""
 
-    MIN_WAIT_TIME_BETWEEN_CMDS = 0.85  # seconds
+    MIN_WAIT_TIME_BETWEEN_CMDS = 1  # seconds
 
     def __init__(self, port: str):
         """
@@ -332,7 +366,7 @@ class GrowattModbusClient:
         """Decorator factory to lock the function call.
 
         Args:
-            enforce_wait_time (bool): Whether to enforce the minimum wait time of 850ms.
+            enforce_wait_time (bool): Whether to enforce the minimum wait time.
         """
 
         def _lock_wrapper(func):
@@ -394,10 +428,15 @@ class GrowattModbusClient:
         """Read input registers from the Modbus server."""
         return self.client.read_input_registers(start, count)
 
+    def read_holding_registers_unsafe(self, start: int, count: int = 1):
+        """Read holding registers from the Modbus server without
+        holding the lock or enforcing the wait time."""
+        return self.client.read_holding_registers(start, count)
+
     @lock_wrapper(enforce_wait_time=False)
     def read_holding_registers(self, start: int, count: int = 1):
         """Read holding registers from the Modbus server."""
-        return self.client.read_holding_registers(start, count)
+        return self.read_holding_registers_unsafe(start, count)
 
     def write_registers_unsafe(self, address: int, values: int):
         """Write multiple registers to the Modbus server without
@@ -425,12 +464,17 @@ class GrowattInverter:
         self.client = GrowattModbusClient(port)
         self.sync_time_thread = Thread(target=self.sync_time)
         self.sync_time_event = Event()
+        self.write_queue = Queue()
+        self.write_thread = Thread(target=self.write_registers)
+        self.write_event = Event()
 
     def connect(self):
         """Connect to the Modbus server and start the datetime thread."""
         self.client.connect()
         if not self.sync_time_thread.is_alive():
             self.sync_time_thread.start()
+        if not self.write_thread.is_alive():
+            self.write_thread.start()
 
     def close(self):
         """Close the connection to the Modbus server and stop the datetime thread."""
@@ -438,6 +482,9 @@ class GrowattInverter:
         self.sync_time_event.set()
         if self.sync_time_thread.is_alive():
             self.sync_time_thread.join()
+        self.write_event.set()
+        if self.write_thread.is_alive():
+            self.write_thread.join()
 
     def sync_time(self):
         """Update the inverter's time every 720 seconds."""
@@ -467,6 +514,71 @@ class GrowattInverter:
 
             if self.sync_time_event.wait(timeout=update_interval):
                 break
+
+    def write_registers(self):
+        """Write registers to the inverter from queue every second."""
+        update_interval = 1  # seconds
+        while not self.write_event.wait(timeout=update_interval):
+            requested = {}
+            while not self.write_queue.empty():
+                start, values = self.write_queue.get_nowait()
+                for i in range(len(values)):
+                    requested[start + i] = values[i]
+
+            if not requested:
+                continue
+
+            try:
+                # Acquire the lock to write the registers
+                self.client.lock.acquire()  # pylint: disable=consider-using-with
+
+                # Read all registers
+                row1 = self.client.read_holding_registers_unsafe(0, 101)  # 0-100
+                row2 = self.client.read_holding_registers_unsafe(101, 62)  # 101-162
+                reg = row1.registers + row2.registers
+                assert len(reg) == 163
+
+                # Update the registers to set the new values
+                forbidden = {*WriteRegistersForbiddenBatch}  # copy
+                for regno, value in requested.items():
+                    reg[regno] = value
+                    forbidden.discard(regno)
+
+                # Split the registers into two ranges
+                ranges = [
+                    (0, reg[:101]),  # 0-100
+                    (101, reg[101:]),  # 101-162
+                ]
+
+                # Remove forbidden/unknown registers from the ranges
+                new_ranges = []
+                for start, values in ranges:
+                    new_values = []
+                    new_start = start
+                    for i, value in enumerate(values):
+                        if (
+                            start + i in forbidden
+                            or start + i not in WriteRegistersBatchable
+                        ):
+                            if new_values:
+                                new_ranges.append((new_start, new_values))
+                                new_values = []
+                            new_start = start + i + 1
+                        else:
+                            new_values.append(value)
+                    if new_values:
+                        new_ranges.append((new_start, new_values))
+                ranges = new_ranges
+
+                # Write the registers in batches for ranges where we have values to set
+                for start, values in ranges:
+                    if any(i in requested for i in range(start, start + len(values))):
+                        self.client.write_registers_unsafe(start, values)
+                        sleep(self.client.MIN_WAIT_TIME_BETWEEN_CMDS)
+            except Exception as exc:  # pylint: disable=broad-except
+                sys.stderr.write(f"[ERROR] Failed to write register: {exc}\n")
+            finally:
+                self.client.lock.release()
 
     @staticmethod
     def registers_to_bytes(
@@ -578,7 +690,8 @@ class GrowattInverter:
         return info
 
     def write_config(self, key: str, value: Union[str, int, float]):
-        """Write a value to a configuration register in the inverter.
+        """Schedule a config write to the inverter to be processed by
+        the write thread in batches.
 
         Args:
             key (str): The configuration key to write.
@@ -612,7 +725,7 @@ class GrowattInverter:
             case _:
                 raise ValueError("Invalid register type")
 
-        self.client.write_registers(start, values)
+        self.write_queue.put((start, values))
 
 
 @dataclass
