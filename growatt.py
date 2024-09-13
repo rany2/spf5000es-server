@@ -407,7 +407,7 @@ class GrowattModbusClient:
         """Read holding registers from the Modbus server."""
         return self.read_holding_registers_unsafe(start, count)
 
-    def write_registers_unsafe(self, address: int, values: int):
+    def write_registers_unsafe(self, address: int, values: List[int]):
         """Write multiple registers to the Modbus server without
         holding the lock or enforcing the wait time.
 
@@ -417,7 +417,7 @@ class GrowattModbusClient:
         return self.client.write_registers(address, values)
 
     @lock_wrapper(enforce_wait_time=True)
-    def write_registers(self, address: int, values: int):
+    def write_registers(self, address: int, values: List[int]):
         """Write multiple registers to the Modbus server."""
         return self.write_registers_unsafe(address, values)
 
@@ -491,8 +491,7 @@ class GrowattInverter:
             requested = {}
             while not self.write_queue.empty():
                 start, values = self.write_queue.get_nowait()
-                for i, value in enumerate(values):
-                    requested[start + i] = value
+                requested[start] = values
 
             for start, values in requested.items():
                 try:
