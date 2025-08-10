@@ -109,7 +109,7 @@ rest:
         unique_id: "growatt_dcdc_temp"
       - name: "Load Percent"
         value_template: "{{ value_json['LoadPercent'] }}"
-        device_class: power
+        icon: mdi:flash
         unit_of_measurement: "%"
         unique_id: "growatt_load_percent"
       - name: "Battery Port Volt"
@@ -245,12 +245,12 @@ rest:
         unique_id: "growatt_battery_watt"
       - name: "MPPT Fan Speed"
         value_template: "{{ value_json['MpptFanSpeedPercent'] }}"
-        device_class: speed
+        icon: mdi:speedometer
         unit_of_measurement: "%"
         unique_id: "growatt_mppt_fan_speed"
       - name: "Inverter Fan Speed"
         value_template: "{{ value_json['InvFanSpeedPercent'] }}"
-        device_class: speed
+        icon: mdi:speedometer
         unit_of_measurement: "%"
         unique_id: "growatt_inverter_fan_speed"
       - name: "Total Charge Amp"
