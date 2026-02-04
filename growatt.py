@@ -19,7 +19,7 @@ from http.server import ThreadingHTTPServer as HTTPServer
 from json import dumps as json_dumps
 from queue import Queue
 from threading import Event, Lock, Thread
-from time import sleep, time
+from time import perf_counter, sleep, time
 from typing import Dict, List, Optional, Union, override
 from urllib.parse import parse_qs
 
@@ -135,7 +135,7 @@ InputRegisters = {
     "TotalDischargeAmps": (84, 1, RegType.UINT, lambda x: x / 10),
     "OPDischargeEnergyTodaykWh": (85, 2, RegType.UINT, lambda x: x / 10),
     "OPDischargeEnergyTotalkWh": (87, 2, RegType.UINT, lambda x: x / 10),
-    "ParaSystemChargeAmps": (90, 1, RegType.UINT, lambda x: x / 10),
+    # "ParaSystemChargeAmps": (90, 1, RegType.UINT, lambda x: x / 10),
     # fmt: on
 }
 
@@ -268,7 +268,7 @@ HoldingAndWriteRegisters = {
     "uwEqTimeOut": (111, 1, RegType.UINT, int, int),
     "uwEqInterval": (112, 1, RegType.UINT, int, int),
     "uwMaxDisChgAmps": (113, 1, RegType.UINT, int, int),
-    "BLVersion2": (162, 1, RegType.UINT, int, None),
+    # "BLVersion2": (162, 1, RegType.UINT, int, None),
     # fmt: on
 }
 
@@ -312,7 +312,8 @@ class GrowattModbusClient:
     pymodbus is not thread-safe, so we need to use a lock to prevent concurrent access.
     Source: https://pymodbus.readthedocs.io/en/v3.7.0/source/client.html"""
 
-    MIN_WAIT_TIME_BETWEEN_CMDS = 1  # seconds
+    MIN_WAIT_TIME_BETWEEN_CMDS = 1.0  # seconds (spec: 850ms minimum, they recommend 1s)
+    MAX_WORDS_PER_CMD = 45
 
     def __init__(self, port: str):
         """
@@ -320,7 +321,7 @@ class GrowattModbusClient:
             port (str): The serial port to use (e.g. "/dev/ttyUSB0").
         """
 
-        self.client = ModbusClient(
+        self._client = ModbusClient(
             framer="rtu",
             port=port,
             baudrate=9600,
@@ -328,98 +329,109 @@ class GrowattModbusClient:
             bytesize=8,
             parity="N",
         )
-        self.lock = Lock()
+        self._lock = Lock()
+        self._last_cmd_time = 0.0
 
-    @staticmethod
-    def lock_wrapper(enforce_wait_time: bool):
-        """Decorator factory to lock the function call.
+    def _validate_register_window(self, start: int, count: int):
+        """Ensure requested registers stay within a single 45-word window."""
 
-        Args:
-            enforce_wait_time (bool): Whether to enforce the minimum wait time.
-        """
+        if start < 0:
+            raise ValueError("Register start must be non-negative")
+        if count <= 0:
+            raise ValueError("Register count must be positive")
+        end = start + count - 1
+        if count > self.MAX_WORDS_PER_CMD:
+            raise ValueError("Register count exceeds 45-word maximum")
+        if start // self.MAX_WORDS_PER_CMD != end // self.MAX_WORDS_PER_CMD:
+            raise ValueError("Register range crosses 45-word boundary")
 
-        def _lock_wrapper(func):
-            """Decorator to lock the function call."""
+    def _wait_for_min_period(self):
+        """Sleep until the minimum inter-command period has elapsed."""
 
-            def wrapper(self: "GrowattModbusClient", *args, **kwargs):
-                """Wrapper function to lock the function call."""
+        elapsed = perf_counter() - self._last_cmd_time
+        remaining = self.MIN_WAIT_TIME_BETWEEN_CMDS - elapsed
+        if remaining > 0:
+            sleep(remaining)
 
-                def wait_and_release():
-                    """Release the lock after the minimum wait time."""
+    def _run_with_constraints(self, func, start: int, count: int):
+        """Validate range, enforce spacing, execute command, and timestamp it."""
 
-                    # Wait for the minimum per Growatt Modbus documentation
-                    sleep(self.MIN_WAIT_TIME_BETWEEN_CMDS)
+        self._validate_register_window(start, count)
+        self._wait_for_min_period()
+        try:
+            return func(start, count)
+        finally:
+            self._last_cmd_time = perf_counter()
 
-                    # Release the lock after waiting for the minimum time
-                    self.lock.release()
+    def _run_write_with_constraints(self, func, start: int, values: List[int]):
+        """Validate write range, enforce spacing, execute command, and timestamp it."""
 
-                try:
-                    # Acquire the lock before calling the function
-                    self.lock.acquire()
+        count = len(values)
+        self._validate_register_window(start, count)
+        self._wait_for_min_period()
+        try:
+            return func(start, values)
+        finally:
+            self._last_cmd_time = perf_counter()
 
-                    # Call the function with the lock acquired
-                    return func(self, *args, **kwargs)
-                finally:
-                    if enforce_wait_time:
-                        # Release the lock after the function call
-                        # while enforcing the minimum wait time.
-                        try:
-                            # Start a new thread to wait and release the lock
-                            # to prevent blocking the request handler.
-                            Thread(target=wait_and_release).start()
-                        except Exception as exc:  # pylint: disable=broad-except
-                            # Print the exception to stderr.
-                            sys.stderr.write(f"[ERROR] {exc}\n")
-
-                            # If we can't start a new thread, just wait and release.
-                            # This might happen when we run out of resources.
-                            wait_and_release()
-                    else:
-                        # Release the lock after the function call
-                        self.lock.release()
-
-            return wrapper
-
-        return _lock_wrapper
-
-    @lock_wrapper(enforce_wait_time=False)
     def connect(self):
         """Connect to the Modbus server."""
-        self.client.connect()
+        with self._lock:
+            self._client.connect()
 
-    @lock_wrapper(enforce_wait_time=False)
     def close(self):
         """Close the connection to the Modbus server."""
-        self.client.close()
+        with self._lock:
+            self._client.close()
 
-    @lock_wrapper(enforce_wait_time=False)
     def read_input_registers(self, start: int, count: int):
         """Read input registers from the Modbus server."""
-        return self.client.read_input_registers(start, count)
+        with self._lock:
+            return self._run_with_constraints(
+                self._client.read_input_registers, start, count
+            )
 
-    def read_holding_registers_unsafe(self, start: int, count: int = 1):
-        """Read holding registers from the Modbus server without
-        holding the lock or enforcing the wait time."""
-        return self.client.read_holding_registers(start, count)
-
-    @lock_wrapper(enforce_wait_time=False)
     def read_holding_registers(self, start: int, count: int = 1):
         """Read holding registers from the Modbus server."""
-        return self.read_holding_registers_unsafe(start, count)
+        with self._lock:
+            return self._run_with_constraints(
+                self._client.read_holding_registers, start, count
+            )
 
     def write_registers_unsafe(self, address: int, values: List[int]):
-        """Write multiple registers to the Modbus server without
-        holding the lock or enforcing the wait time.
+        """Write multiple registers to the Modbus server without enforcing any
+        constraints; i.e. without locking or minimum wait time between commands."""
+        return self._client.write_registers(address, values)
 
-        This is useful when the operation is time-sensitive and
-        we want to ensure that the value is written as soon as
-        possible. This is useful for setting the inverter's time."""
-        return self.client.write_registers(address, values)
-
-    @lock_wrapper(enforce_wait_time=True)
     def write_registers(self, address: int, values: List[int]):
         """Write multiple registers to the Modbus server."""
-        return self.write_registers_unsafe(address, values)
+        with self._lock:
+            return self._run_write_with_constraints(
+                self._client.write_registers, address, values
+            )
+
+
+def _build_register_windows(registers: Dict[str, tuple]) -> List[tuple[int, int]]:
+    """Compute the minimal set of 45-word windows covering given registers."""
+
+    windows = {}
+    for start, length, *_ in registers.values():
+        block = start // GrowattModbusClient.MAX_WORDS_PER_CMD
+        end = start + length - 1
+        if block not in windows:
+            windows[block] = [start, end]
+        else:
+            windows[block][0] = min(windows[block][0], start)
+            windows[block][1] = max(windows[block][1], end)
+
+    return [
+        (start, end - start + 1)
+        for start, end in sorted(windows.values(), key=lambda x: x[0])
+    ]
+
+
+INPUT_REGISTER_WINDOWS = _build_register_windows(InputRegisters)
+HOLDING_REGISTER_WINDOWS = _build_register_windows(HoldingAndWriteRegisters)
 
 
 class GrowattInverter:
@@ -460,7 +472,7 @@ class GrowattInverter:
         update_interval = 720  # seconds
         while True:
             try:
-                self.client.lock.acquire()  # pylint: disable=consider-using-with
+                self.client._lock.acquire()  # pylint: disable=consider-using-with
                 sleep(int(time() + 1) - time())  # Wait until the next exact second
                 now = datetime.now()
                 values = [
@@ -479,7 +491,7 @@ class GrowattInverter:
                 sys.stderr.write(f"[ERROR] Failed to update time: {exc}\n")
             finally:
                 sleep(self.client.MIN_WAIT_TIME_BETWEEN_CMDS)
-                self.client.lock.release()
+                self.client._lock.release()
 
             if self.sync_time_event.wait(timeout=update_interval):
                 break
@@ -498,6 +510,22 @@ class GrowattInverter:
                     self.client.write_registers(start, values)
                 except Exception as exc:  # pylint: disable=broad-except
                     sys.stderr.write(f"[ERROR] Failed to write registers: {exc}\n")
+
+    def _read_register_windows(
+        self, reader, windows: List[tuple[int, int]]
+    ) -> List[int]:
+        """Read only the populated 45-word windows and place them in a single buffer."""
+
+        if not windows:
+            return []
+
+        max_end = max(start + count for start, count in windows)
+        registers: List[int] = [0] * max_end
+        for start, count in windows:
+            response = reader(start, count)
+            registers[start : start + count] = response.registers
+
+        return registers
 
     @staticmethod
     def registers_to_bytes(
@@ -585,8 +613,9 @@ class GrowattInverter:
 
     def read_status(self):
         """Read the system status and other information from the inverter."""
-        row = self.client.read_input_registers(0, 91)
-        reg = row.registers
+        reg = self._read_register_windows(
+            self.client.read_input_registers, INPUT_REGISTER_WINDOWS
+        )
         info = {}
         for key, value in InputRegisters.items():
             start, length, type_, postprocess = value
@@ -597,9 +626,9 @@ class GrowattInverter:
 
     def read_config(self):
         """Read the system configuration from the inverter."""
-        row1 = self.client.read_holding_registers(0, 101)  # 0-100
-        row2 = self.client.read_holding_registers(101, 62)  # 101-162
-        reg = row1.registers + row2.registers
+        reg = self._read_register_windows(
+            self.client.read_holding_registers, HOLDING_REGISTER_WINDOWS
+        )
         info = {}
         for key, value in HoldingAndWriteRegisters.items():
             start, length, type_, readpostprocess, _ = value
