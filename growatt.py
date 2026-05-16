@@ -9,22 +9,31 @@ import binascii
 import configparser
 import hashlib
 import hmac
-import sys
+import logging
+import math
+import selectors
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
+from functools import wraps
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler
-from http.server import ThreadingHTTPServer as HTTPServer
 from json import dumps as json_dumps
-from queue import Queue
-from threading import Event, Lock, Thread
-from time import perf_counter, sleep, time
-from typing import Dict, List, Optional, Union, override
-from urllib.parse import parse_qs
+from socket import timeout as SocketTimeout
+from socketserver import TCPServer as HTTPServer
+from socketserver import ThreadingMixIn
+from threading import BoundedSemaphore, RLock
+from time import perf_counter, sleep
+from typing import Any, Callable, Dict, List, Optional, Union, override
+from urllib.parse import parse_qs, urlsplit
 
 from pymodbus.client import ModbusSerialClient as ModbusClient
 from pymodbus.exceptions import ModbusException
+
+
+logger = logging.getLogger(__name__)
+logger.addHandler(logging.NullHandler())
 
 
 def str2bool(value: Union[str, bool, int]) -> bool:
@@ -46,6 +55,32 @@ def str2bool2int(value: Union[str, bool, int]) -> int:
     return int(str2bool(value))
 
 
+def optional_int(value: str) -> Optional[int]:
+    """Parse an optional integer config value."""
+
+    value = value.strip()
+    if value.lower() in ("", "none", "null", "false"):
+        return None
+    return int(value)
+
+
+def parse_config_value(value: str) -> Union[str, int, float]:
+    """Parse a query value into a finite scalar for register preprocessing."""
+
+    try:
+        parsed_value: Union[str, int, float] = float(value)
+    except ValueError:
+        return value
+
+    if not math.isfinite(parsed_value):
+        raise ValueError("Invalid value")
+
+    value_int = int(parsed_value)
+    if abs(value_int - parsed_value) < 1e-3:
+        return value_int
+    return parsed_value
+
+
 ## Register Types ##
 class RegType(Enum):
     """Enum for register types."""
@@ -56,7 +91,7 @@ class RegType(Enum):
 
 
 ## Input Registers ##
-SystemStatusR = {
+SYSTEM_STATUS_R = {
     0: "Standby",
     1: "PV&Grid Supporting Loads",
     2: "Battery Discharging",
@@ -72,10 +107,9 @@ SystemStatusR = {
     12: "PV Charging+Loads Supporting",
     13: "Export to Grid",
 }
-InputRegisters = {
+INPUT_REGISTERS = {
     # Register: (Start, Length, Type, PostProcess)
-    # fmt: off
-    "SystemStatus": (0, 1, RegType.UINT, lambda x: SystemStatusR[x]),
+    "SystemStatus": (0, 1, RegType.UINT, lambda x: SYSTEM_STATUS_R[x]),
     "PV1Volt": (1, 1, RegType.UINT, lambda x: x / 10),
     "PV2Volt": (2, 1, RegType.UINT, lambda x: x / 10),
     "PV1Watt": (3, 2, RegType.UINT, lambda x: x / 10),
@@ -104,7 +138,12 @@ InputRegisters = {
     "Buck2TempC": (33, 1, RegType.INT, lambda x: x / 10),
     "OutputAmps": (34, 1, RegType.UINT, lambda x: x / 10),
     "InvAmps": (35, 1, RegType.UINT, lambda x: x / 10),
-    "ACInputWatt": (36, 2, RegType.INT, lambda x: x / 10), # > 0: From Grid, < 0: To Grid
+    "ACInputWatt": (
+        36,
+        2,
+        RegType.INT,
+        lambda x: x / 10,
+    ),  # > 0: From Grid, < 0: To Grid
     "ACInputVA": (38, 2, RegType.UINT, lambda x: x / 10),
     "FaultBit": (40, 1, RegType.UINT, int),
     "WarningBit": (41, 1, RegType.UINT, int),
@@ -128,27 +167,30 @@ InputRegisters = {
     "ACDischargeVA": (71, 2, RegType.UINT, lambda x: x / 10),
     "BatteryDischargeWatt": (73, 2, RegType.UINT, lambda x: x / 10),
     "BatteryDischargeVA": (75, 2, RegType.UINT, lambda x: x / 10),
-    "BatteryWatt": (77, 2, RegType.INT, lambda x: x / 10), # > 0: Discharge, < 0: Charge
+    "BatteryWatt": (
+        77,
+        2,
+        RegType.INT,
+        lambda x: x / 10,
+    ),  # > 0: Discharge, < 0: Charge
     "MpptFanSpeedPercent": (81, 1, RegType.UINT, int),
     "InvFanSpeedPercent": (82, 1, RegType.UINT, int),
     "TotalChargeAmps": (83, 1, RegType.UINT, lambda x: x / 10),
     "TotalDischargeAmps": (84, 1, RegType.UINT, lambda x: x / 10),
     "OPDischargeEnergyTodaykWh": (85, 2, RegType.UINT, lambda x: x / 10),
     "OPDischargeEnergyTotalkWh": (87, 2, RegType.UINT, lambda x: x / 10),
-    # "ParaSystemChargeAmps": (90, 1, RegType.UINT, lambda x: x / 10),
-    # fmt: on
 }
 
 ## Holding Registers ##
-OutputConfigR = {0: "SBU", 1: "SOL", 2: "UTI", 3: "SUB"}
-OutputConfigW = {v: k for k, v in OutputConfigR.items()}
-ChargeConfigR = {0: "PV First", 1: "PV&UTI", 2: "PV Only"}
-ChargeConfigW = {v: k for k, v in ChargeConfigR.items()}
-PVModelR = {0: "Independent", 1: "Parallel"}
-PVModelW = {v: k for k, v in PVModelR.items()}
-ACInModelR = {0: "APL", 1: "UPS", 2: "GEN"}
-ACInModelW = {v: k for k, v in ACInModelR.items()}
-OutputVoltTypeR = {
+OUTPUT_CONFIG_R = {0: "SBU", 1: "SOL", 2: "UTI", 3: "SUB"}
+OUTPUT_CONFIG_W = {v: k for k, v in OUTPUT_CONFIG_R.items()}
+CHARGE_CONFIG_R = {0: "PV First", 1: "PV&UTI", 2: "PV Only"}
+CHARGE_CONFIG_W = {v: k for k, v in CHARGE_CONFIG_R.items()}
+PV_MODEL_R = {0: "Independent", 1: "Parallel"}
+PV_MODEL_W = {v: k for k, v in PV_MODEL_R.items()}
+AC_IN_MODEL_R = {0: "APL", 1: "UPS", 2: "GEN"}
+AC_IN_MODEL_W = {v: k for k, v in AC_IN_MODEL_R.items()}
+OUTPUT_VOLT_TYPE_R = {
     0: "208VAC",
     1: "230VAC",
     2: "240VAC",
@@ -157,49 +199,82 @@ OutputVoltTypeR = {
     5: "110VAC",
     6: "120VAC",
 }
-OutputVoltTypeW = {v: k for k, v in OutputVoltTypeR.items()}
-OutputFreqTypeR = {0: "50Hz", 1: "60Hz"}
-OutputFreqTypeW = {v: k for k, v in OutputFreqTypeR.items()}
-OverLoadRestartR = {0: "Yes", 1: "No", 2: "Switch to UTI"}
-OverLoadRestartW = {v: k for k, v in OverLoadRestartR.items()}
-OverTempRestartR = {0: True, 1: False}
-OverTempRestartW = {v: k for k, v in OverTempRestartR.items()}
-BatteryTypeR = {0: "AGM", 1: "FLD", 2: "USE", 3: "Lithium", 4: "USE2"}
-BatteryTypeW = {v: k for k, v in BatteryTypeR.items()}
-AgingModeR = {0: "Normal", 1: "Aging"}
-AgingModeW = {v: k for k, v in AgingModeR.items()}
-SafetyTypeR = {1: "Standard", 2: "ETL", 3: "AS4777", 4: "CQC", 5: "VDE4105"}
-SafetyTypeW = {v: k for k, v in SafetyTypeR.items()}
-OnOffR = {0x0000: "Output enable", 0x0100: "Output disable"}
-HoldingAndWriteRegisters = {
+OUTPUT_VOLT_TYPE_W = {v: k for k, v in OUTPUT_VOLT_TYPE_R.items()}
+OUTPUT_FREQ_TYPE_R = {0: "50Hz", 1: "60Hz"}
+OUTPUT_FREQ_TYPE_W = {v: k for k, v in OUTPUT_FREQ_TYPE_R.items()}
+OVER_LOAD_RESTART_R = {0: "Yes", 1: "No", 2: "Switch to UTI"}
+OVER_LOAD_RESTART_W = {v: k for k, v in OVER_LOAD_RESTART_R.items()}
+OVER_TEMP_RESTART_R = {0: True, 1: False}
+OVER_TEMP_RESTART_W = {v: k for k, v in OVER_TEMP_RESTART_R.items()}
+BATTERY_TYPE_R = {0: "AGM", 1: "FLD", 2: "USE", 3: "Lithium", 4: "USE2"}
+BATTERY_TYPE_W = {v: k for k, v in BATTERY_TYPE_R.items()}
+AGING_MODE_R = {0: "Normal", 1: "Aging"}
+AGING_MODE_W = {v: k for k, v in AGING_MODE_R.items()}
+SAFETY_TYPE_R = {1: "Standard", 2: "ETL", 3: "AS4777", 4: "CQC", 5: "VDE4105"}
+SAFETY_TYPE_W = {v: k for k, v in SAFETY_TYPE_R.items()}
+ON_OFF_R = {0x0000: "Output enable", 0x0100: "Output disable"}
+HOLDING_AND_WRITE_REGISTERS = {
     # Register: (Start, Length, Type, ReadPostProcess, WritePreProcess (None if not writeable))
-    # fmt: off
-    "OnOff": (0, 1, RegType.UINT, lambda x: OnOffR[x], None),
-    "OutputConfig": (1, 1, RegType.UINT, lambda x: OutputConfigR[x], lambda x: OutputConfigW[x]),
-    "ChargeConfig": (2, 1, RegType.UINT, lambda x: ChargeConfigR[x], lambda x: ChargeConfigW[x]),
-    "UtiOutStart": (3, 1, RegType.UINT, int, int),     # 0-23
-    "UtiOutEnd": (4, 1, RegType.UINT, int, int),       # 0-23
+    "OnOff": (0, 1, RegType.UINT, lambda x: ON_OFF_R[x], None),
+    "OutputConfig": (
+        1,
+        1,
+        RegType.UINT,
+        lambda x: OUTPUT_CONFIG_R[x],
+        lambda x: OUTPUT_CONFIG_W[x],
+    ),
+    "ChargeConfig": (
+        2,
+        1,
+        RegType.UINT,
+        lambda x: CHARGE_CONFIG_R[x],
+        lambda x: CHARGE_CONFIG_W[x],
+    ),
+    "UtiOutStart": (3, 1, RegType.UINT, int, int),  # 0-23
+    "UtiOutEnd": (4, 1, RegType.UINT, int, int),  # 0-23
     "UtiChargeStart": (5, 1, RegType.UINT, int, int),  # 0-23
-    "UtiChargeEnd": (6, 1, RegType.UINT, int, int),    # 0-23
-    "PVModel": (7, 1, RegType.UINT, lambda x: PVModelR[x], lambda x: PVModelW[x]),
-    "ACInModel": (8, 1, RegType.UINT, lambda x: ACInModelR[x], lambda x: ACInModelW[x]),
+    "UtiChargeEnd": (6, 1, RegType.UINT, int, int),  # 0-23
+    "PVModel": (7, 1, RegType.UINT, lambda x: PV_MODEL_R[x], lambda x: PV_MODEL_W[x]),
+    "ACInModel": (
+        8,
+        1,
+        RegType.UINT,
+        lambda x: AC_IN_MODEL_R[x],
+        lambda x: AC_IN_MODEL_W[x],
+    ),
     "FWVersion": (9, 3, RegType.CHAR, str, None),
     "FWVersion2": (12, 3, RegType.CHAR, str, None),
     "LCDLanguage": (15, 1, RegType.UINT, int, int),
     "GridV_Adj": (16, 1, RegType.UINT, int, None),
     "InvV_Adj": (17, 1, RegType.UINT, int, None),
-    "OutputVoltType": (18, 1, RegType.UINT,
-                       lambda x: OutputVoltTypeR[x],
-                       lambda x: OutputVoltTypeW[x]),
-    "OutputFreqType": (19, 1, RegType.UINT,
-                       lambda x: OutputFreqTypeR[x],
-                       lambda x: OutputFreqTypeW[x]),
-    "OverLoadRestart": (20, 1, RegType.UINT,
-                        lambda x: OverLoadRestartR[x],
-                        lambda x: OverLoadRestartW[x]),
-    "OverTempRestart": (21, 1, RegType.UINT,
-                        lambda x: OverTempRestartR[x],
-                        lambda x: OverTempRestartW[str2bool(x)]),
+    "OutputVoltType": (
+        18,
+        1,
+        RegType.UINT,
+        lambda x: OUTPUT_VOLT_TYPE_R[x],
+        lambda x: OUTPUT_VOLT_TYPE_W[x],
+    ),
+    "OutputFreqType": (
+        19,
+        1,
+        RegType.UINT,
+        lambda x: OUTPUT_FREQ_TYPE_R[x],
+        lambda x: OUTPUT_FREQ_TYPE_W[x],
+    ),
+    "OverLoadRestart": (
+        20,
+        1,
+        RegType.UINT,
+        lambda x: OVER_LOAD_RESTART_R[x],
+        lambda x: OVER_LOAD_RESTART_W[x],
+    ),
+    "OverTempRestart": (
+        21,
+        1,
+        RegType.UINT,
+        lambda x: OVER_TEMP_RESTART_R[x],
+        lambda x: OVER_TEMP_RESTART_W[str2bool(x)],
+    ),
     "BuzzerEnable": (22, 1, RegType.UINT, bool, str2bool2int),
     "SerialNumber": (23, 5, RegType.CHAR, str, str),
     "MoudleH": (28, 1, RegType.UINT, int, int),
@@ -213,10 +288,28 @@ HoldingAndWriteRegisters = {
     "FloatChargeVolt": (36, 1, RegType.UINT, lambda x: x / 10, lambda x: int(x) * 10),
     "BatLowtoUti": (37, 1, RegType.UINT, lambda x: x / 10, lambda x: int(x) * 10),
     "ACChargeAmps": (38, 1, RegType.UINT, int, int),
-    "BatteryType": (39, 1, RegType.UINT, lambda x: BatteryTypeR[x], lambda x: BatteryTypeW[x]),
-    "AgingMode": (40, 1, RegType.UINT, lambda x: AgingModeR[x], lambda x: AgingModeW[x]),
+    "BatteryType": (
+        39,
+        1,
+        RegType.UINT,
+        lambda x: BATTERY_TYPE_R[x],
+        lambda x: BATTERY_TYPE_W[x],
+    ),
+    "AgingMode": (
+        40,
+        1,
+        RegType.UINT,
+        lambda x: AGING_MODE_R[x],
+        lambda x: AGING_MODE_W[x],
+    ),
     "FunctionMask": (41, 1, RegType.UINT, int, int),
-    "SafetyType": (42, 1, RegType.UINT, lambda x: SafetyTypeR[x], lambda x: SafetyTypeW[x]),
+    "SafetyType": (
+        42,
+        1,
+        RegType.UINT,
+        lambda x: SAFETY_TYPE_R[x],
+        lambda x: SAFETY_TYPE_W[x],
+    ),
     "DTC": (43, 1, RegType.UINT, int, None),
     "SysYear": (45, 1, RegType.UINT, int, int),
     "SysMonth": (46, 1, RegType.UINT, int, int),
@@ -224,31 +317,11 @@ HoldingAndWriteRegisters = {
     "SysHour": (48, 1, RegType.UINT, int, int),
     "SysMin": (49, 1, RegType.UINT, int, int),
     "SysSec": (50, 1, RegType.UINT, int, int),
-    #"uwAcVoltHighL": (51, 1, RegType.UINT, int, None),
-    #"uwAcVoltLowL": (52, 1, RegType.UINT, int, None),
-    #"uwAcFreqHighL": (53, 1, RegType.UINT, int, None),
-    #"uwAcFreqLowL": (54, 1, RegType.UINT, int, None),
-    #"ManufacturerInfo": (59, 8, RegType.CHAR, str, None),
-    #"FWBuildNo4": (67, 1, RegType.UINT, int, None),
-    #"FWBuildNo3": (68, 1, RegType.UINT, int, None),
-    #"FWBuildNo2": (69, 1, RegType.UINT, int, None),
-    #"FWBuildNo1": (70, 1, RegType.UINT, int, None),
-    "SysWeekly": (72, 1, RegType.UINT, int, int),
-    "ModbusVersion": (73, 1, RegType.UINT, lambda x: x / 100, None),
-    "SCC_ComMode": (75, 1, RegType.UINT, int, None),
     "RateWatt": (76, 2, RegType.UINT, lambda x: x / 10, None),
     "RateVA": (78, 2, RegType.UINT, lambda x: x / 10, None),
     "ComboardVer": (80, 1, RegType.UINT, int, None),
     "uwBatPieceNum": (81, 1, RegType.UINT, int, int),
     "wBatLowCutOff": (82, 1, RegType.UINT, lambda x: x / 10, None),
-    #"NomGridVolt": (84, 1, RegType.UINT, int, None),
-    #"NomGridFreq": (85, 1, RegType.UINT, int, None),
-    #"NomBatVolt": (86, 1, RegType.UINT, int, None),
-    #"NomPvAmps": (87, 1, RegType.UINT, int, None),
-    #"NomAcChgAmps": (88, 1, RegType.UINT, int, None),
-    #"NomOpVolt": (89, 1, RegType.UINT, int, None),
-    #"NomOpFreq": (90, 1, RegType.UINT, int, None),
-    #"NomOpPow": (91, 1, RegType.UINT, int, None),
     "uwAC2BatVolt": (95, 1, RegType.UINT, lambda x: x / 10, lambda x: int(x) * 10),
     "BypEnable": (96, 1, RegType.UINT, bool, str2bool2int),
     "PowSavingEnable": (97, 1, RegType.UINT, bool, str2bool2int),
@@ -262,40 +335,34 @@ HoldingAndWriteRegisters = {
     "ParaMaxChgAmps": (105, 1, RegType.UINT, int, None),
     "LiProtocolType": (106, 1, RegType.UINT, int, int),
     "AudioAlarmEnable": (107, 1, RegType.UINT, bool, str2bool2int),
-    "uwEqEnable": (108, 1, RegType.UINT, bool, str2bool2int),
-    "uwEqChgVolt": (109, 1, RegType.UINT, int, int),
-    "uwEqTime": (110, 1, RegType.UINT, int, int),
-    "uwEqTimeOut": (111, 1, RegType.UINT, int, int),
-    "uwEqInterval": (112, 1, RegType.UINT, int, int),
-    "uwMaxDisChgAmps": (113, 1, RegType.UINT, int, int),
-    # "BLVersion2": (162, 1, RegType.UINT, int, None),
-    # fmt: on
 }
 
 
 def generate_index_html():
     """Generates the index HTML page."""
-    index_html = (
+    writable_keys = "".join(
+        f"<li>{key}</li>"
+        for key, item in HOLDING_AND_WRITE_REGISTERS.items()
+        if item[4]
+    )
+    return (
         "<!DOCTYPE html><html lang='en'><head><title>Growatt</title>"
         "<style>body{font-family:Arial,Helvetica,sans-serif;}</style>"
         "<meta name=viewport content='width=device-width,initial-scale=1'>"
         "</head><body><h1>Growatt</h1><h2>View Data:</h2><ul>"
         "<li><a href='status' target='_blank'>System Status</a>"
         "<li><a href='config' target='_blank'>System Configuration</a></ul>"
+        "<h2>Time Sync:</h2><form action='time-sync' method='GET'>"
+        "<input type='submit' value='Sync Time Now'>"
+        "<input type='hidden' name='_method' value='PUT'></form>"
         "<h2>Modify Configuration:</h2><form action='config' method='GET'>"
         "<input type='text' name='key' placeholder='Key'>"
         "<input type='text' name='value' placeholder='Value'>"
         "<input type='submit' value='Submit'>"
         "<input type='hidden' name='_method' value='PUT'></form>"
         "<p>Writeable keys:</p><ul>"
-    )
-    for key, item in HoldingAndWriteRegisters.items():
-        if not item[4]:  # not writeable
-            continue
-        index_html += f"<li>{key}</li>"
-    index_html += "</ul></body></html>"
-    index_html = index_html.encode("utf-8")
-    return index_html
+        f"{writable_keys}</ul></body></html>"
+    ).encode("utf-8")
 
 
 ## HTTP Server ##
@@ -303,24 +370,147 @@ INDEX_HTML = generate_index_html()
 CONTENT_TYPE_JSON = "application/json; charset=utf-8"
 CONTENT_TYPE_TEXT = "text/plain; charset=utf-8"
 CONTENT_TYPE_HTML = "text/html; charset=utf-8"
+MAX_AUTH_HEADER_LENGTH = 4096
+MAX_QUERY_FIELDS = 8
+MAX_QUERY_LENGTH = 2048
 
 
-class GrowattModbusClient:
-    """Modbus RTU client with lock that adheares to Growatt specifications in terms
-    of waiting time between requests when necessary.
+class WriteQueueFullError(RuntimeError):
+    """Raised when the pending Modbus write queue is full."""
 
-    pymodbus is not thread-safe, so we need to use a lock to prevent concurrent access.
-    Source: https://pymodbus.readthedocs.io/en/v3.7.0/source/client.html"""
 
-    MIN_WAIT_TIME_BETWEEN_CMDS = 1.0  # seconds (spec: 850ms minimum, they recommend 1s)
-    MAX_WORDS_PER_CMD = 45
+class GrowattHTTPServer(ThreadingMixIn, HTTPServer):
+    """Selector-backed, bounded-thread HTTP server for embedded API service."""
 
-    def __init__(self, port: str):
+    allow_reuse_address = True
+    request_queue_size = 16
+    daemon_threads = True
+    block_on_close = False
+
+    def __init__(
+        self,
+        *args,
+        request_queue_size: int = 16,
+        max_worker_threads: int = 8,
+        **kwargs,
+    ):
+        self.request_queue_size = max(1, request_queue_size)
+        self.max_worker_threads = max(1, max_worker_threads)
+        self._worker_slots = BoundedSemaphore(self.max_worker_threads)
+        super().__init__(*args, **kwargs)
+        logger.info(
+            "HTTP server initialized bind=%s:%s request_queue_size=%s max_worker_threads=%s",
+            self.server_address[0],
+            self.server_address[1],
+            self.request_queue_size,
+            self.max_worker_threads,
+        )
+
+    @override
+    def process_request(self, request, client_address):
+        """Start a worker for an accepted request, or shed excess clients."""
+
+        if not self._try_acquire_worker_slot():
+            logger.warning(
+                "HTTP worker pool full; closing client=%s max_worker_threads=%s",
+                client_address,
+                self.max_worker_threads,
+            )
+            self.close_request(request)
+            return
+
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self._worker_slots.release()
+            raise
+
+    def _try_acquire_worker_slot(self) -> bool:
+        """Reserve capacity for a request without blocking the accept loop."""
+
+        return self._worker_slots.acquire(  # pylint: disable=consider-using-with
+            blocking=False
+        )
+
+    @override
+    def process_request_thread(self, request, client_address):
+        """Release the worker slot after ThreadingMixIn finishes the request."""
+
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._worker_slots.release()
+
+    def serve_forever(
+        self,
+        poll_interval: float = 0.5,
+        on_poll: Optional[Callable[[], None]] = None,
+        get_poll_timeout: Optional[Callable[[], Optional[float]]] = None,
+    ):
+        """Serve requests from a selector loop and run scheduled callbacks.
+
+        selectors.DefaultSelector maps to epoll on Linux, kqueue on macOS/BSD, and
+        the best available polling primitive elsewhere.
+        """
+
+        shutdown_request_attr = "_BaseServer__shutdown_request"
+        is_shutdown = getattr(self, "_BaseServer__is_shut_down")
+        is_shutdown.clear()
+        logger.info("HTTP server entering serve_forever loop")
+        try:
+            with selectors.DefaultSelector() as selector:
+                selector.register(self, selectors.EVENT_READ)
+                while not getattr(self, shutdown_request_attr):
+                    if on_poll is not None:
+                        on_poll()
+
+                    timeout = max(0.0, poll_interval)
+                    if get_poll_timeout is not None:
+                        next_timeout = get_poll_timeout()
+                        if next_timeout is not None:
+                            timeout = min(timeout, max(0.0, next_timeout))
+
+                    ready = selector.select(timeout)
+                    if getattr(self, shutdown_request_attr):
+                        break
+                    if ready:
+                        logger.debug("HTTP server handling ready request")
+                        self._handle_request_noblock()
+                    self.service_actions()
+        finally:
+            setattr(self, shutdown_request_attr, False)
+            is_shutdown.set()
+            logger.info("HTTP server serve_forever loop stopped")
+
+
+class GrowattModbusClient:  # pylint: disable=too-many-instance-attributes
+    """Modbus RTU client with bounded recovery around pymodbus operations."""
+
+    MAX_READ_REGISTERS = 125
+    # Growatt-compatible inverter firmwares can silently drop large reads even
+    # though Modbus RTU permits up to 125 registers in one read response.
+    MAX_DEVICE_READ_REGISTERS = 45
+    MAX_WRITE_REGISTERS = 123
+
+    def __init__(
+        self,
+        port: str,
+        timeout_sec: float = 1.5,
+        retries: int = 2,
+        reconnect_delay_sec: float = 0.2,
+    ):
         """
         Args:
             port (str): The serial port to use (e.g. "/dev/ttyUSB0").
+            timeout_sec (float): Per-request serial timeout.
+            retries (int): Number of application-level retries after a failed request.
+            reconnect_delay_sec (float): Delay before reopening the serial port.
         """
 
+        self._port = port
+        self._timeout_sec = max(0.1, timeout_sec)
+        self._retries = max(0, retries)
+        self._reconnect_delay_sec = max(0.0, reconnect_delay_sec)
         self._client = ModbusClient(
             framer="rtu",
             port=port,
@@ -328,193 +518,544 @@ class GrowattModbusClient:
             stopbits=1,
             bytesize=8,
             parity="N",
+            timeout=self._timeout_sec,
+            retries=0,
         )
-        self._lock = Lock()
-        self._last_cmd_time = 0.0
+        self._consecutive_failures = 0
+        self._next_allowed_operation: Optional[float] = None
+        logger.info(
+            "Modbus client configured port=%s timeout_sec=%s retries=%s "
+            "reconnect_delay_sec=%s",
+            self._port,
+            self._timeout_sec,
+            self._retries,
+            self._reconnect_delay_sec,
+        )
 
-    def _validate_register_window(self, start: int, count: int):
-        """Ensure requested registers stay within a single 45-word window."""
+    def _connect_locked(self):
+        """Open the serial client and fail if the port cannot be opened."""
+
+        logger.info("Opening Modbus serial port port=%s", self._port)
+        if not self._client.connect():
+            logger.error("Unable to open Modbus serial port port=%s", self._port)
+            raise ModbusException(f"Unable to open Modbus serial port {self._port}")
+        logger.info("Modbus serial port opened port=%s", self._port)
+
+    def _reopen_locked(self):
+        """Reopen the serial port after a protocol or transport failure."""
+
+        logger.warning("Reopening Modbus serial port port=%s", self._port)
+        try:
+            self._client.close()
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.warning("Failed to close Modbus serial port: %s", exc)
+        if self._reconnect_delay_sec:
+            logger.debug(
+                "Waiting before Modbus reconnect delay_sec=%s",
+                self._reconnect_delay_sec,
+            )
+            sleep(self._reconnect_delay_sec)
+        self._connect_locked()
+
+    def _record_success_locked(self):
+        """Clear the consecutive-failure counter after a valid response."""
+
+        if self._consecutive_failures:
+            logger.info(
+                "Modbus request succeeded after failures failures=%s",
+                self._consecutive_failures,
+            )
+        self._consecutive_failures = 0
+
+    def _record_failure_locked(self, exc: Exception):
+        """Track failures and reopen the serial port."""
+
+        self._consecutive_failures += 1
+        logger.warning(
+            "Modbus request failed failures=%s error=%s",
+            self._consecutive_failures,
+            exc,
+        )
+        try:
+            self._reopen_locked()
+        except Exception as reopen_exc:  # pylint: disable=broad-except
+            logger.warning(
+                "Failed to reopen Modbus serial port: %s",
+                reopen_exc,
+            )
+
+    def _with_recovery_locked(self, operation: Callable[[], Any]) -> Any:
+        """Run a Modbus operation with bounded retries and recovery."""
+
+        last_exception: Optional[Exception] = None
+        for attempt in range(self._retries + 1):
+            logger.debug(
+                "Starting Modbus operation attempt=%s max_attempts=%s",
+                attempt + 1,
+                self._retries + 1,
+            )
+            try:
+                result = operation()
+                self._record_success_locked()
+                logger.debug("Modbus operation completed attempt=%s", attempt + 1)
+                return result
+            except Exception as exc:  # pylint: disable=broad-except
+                last_exception = exc
+                self._record_failure_locked(exc)
+                if attempt < self._retries and self._reconnect_delay_sec:
+                    logger.debug(
+                        "Waiting before Modbus retry attempt=%s delay_sec=%s",
+                        attempt + 2,
+                        self._reconnect_delay_sec,
+                    )
+                    sleep(self._reconnect_delay_sec)
+
+        logger.error(
+            "Modbus operation exhausted retries attempts=%s last_error=%s",
+            self._retries + 1,
+            last_exception,
+        )
+        raise ModbusException(
+            f"Modbus operation failed after {self._retries + 1} attempt(s): "
+            f"{last_exception}"
+        )
+
+    def defer_next_operations(self, delay_sec: float):
+        """Require subsequent Modbus operations to wait for a settle interval."""
+
+        delay_sec = max(0.0, delay_sec)
+        deadline = perf_counter() + delay_sec
+        if self._next_allowed_operation is None:
+            self._next_allowed_operation = deadline
+        else:
+            self._next_allowed_operation = max(
+                self._next_allowed_operation,
+                deadline,
+            )
+        logger.debug("Deferred next Modbus operation delay_sec=%s", delay_sec)
+
+    def wait_until_ready_for_operation(self):
+        """Wait until a prior config write's settle interval has elapsed."""
+
+        if self._next_allowed_operation is None:
+            return
+
+        wait_sec = self._next_allowed_operation - perf_counter()
+        if wait_sec > 0.0:
+            logger.debug(
+                "Waiting after config write before Modbus operation wait_sec=%s",
+                wait_sec,
+            )
+            sleep(wait_sec)
+        self._next_allowed_operation = None
+
+    @staticmethod
+    def _validate_register_range(start: int, count: int):
+        """Ensure a register range has valid addressing and length."""
 
         if start < 0:
             raise ValueError("Register start must be non-negative")
         if count <= 0:
             raise ValueError("Register count must be positive")
-        end = start + count - 1
-        if count > self.MAX_WORDS_PER_CMD:
-            raise ValueError("Register count exceeds 45-word maximum")
-        if start // self.MAX_WORDS_PER_CMD != end // self.MAX_WORDS_PER_CMD:
-            raise ValueError("Register range crosses 45-word boundary")
 
-    def _wait_for_min_period(self):
-        """Sleep until the minimum inter-command period has elapsed."""
+    def _validate_read_register_range(self, start: int, count: int):
+        """Ensure a read request fits the inverter's reliable read size."""
 
-        elapsed = perf_counter() - self._last_cmd_time
-        remaining = self.MIN_WAIT_TIME_BETWEEN_CMDS - elapsed
-        if remaining > 0:
-            sleep(remaining)
+        self._validate_register_range(start, count)
+        if count > self.MAX_DEVICE_READ_REGISTERS:
+            raise ValueError(
+                f"Register count exceeds {self.MAX_DEVICE_READ_REGISTERS}-register "
+                "inverter read maximum"
+            )
 
-    def _run_with_constraints(self, func, start: int, count: int):
-        """Validate range, enforce spacing, execute command, and timestamp it."""
+    def _validate_write_register_range(self, start: int, count: int):
+        """Ensure a function-16 write request fits in one Modbus frame."""
 
-        self._validate_register_window(start, count)
-        self._wait_for_min_period()
-        try:
-            return func(start, count)
-        finally:
-            self._last_cmd_time = perf_counter()
+        self._validate_register_range(start, count)
+        if count > self.MAX_WRITE_REGISTERS:
+            raise ValueError(
+                f"Register count exceeds {self.MAX_WRITE_REGISTERS}-register "
+                "write maximum"
+            )
 
-    def _run_write_with_constraints(self, func, start: int, values: List[int]):
-        """Validate write range, enforce spacing, execute command, and timestamp it."""
+    @staticmethod
+    def _validate_register_values(values: List[int]):
+        """Ensure all register words can be encoded in a Modbus frame."""
+
+        for value in values:
+            if not isinstance(value, int) or value < 0 or value > 0xFFFF:
+                raise ValueError("Register values must be unsigned 16-bit integers")
+
+    @staticmethod
+    def _raise_for_modbus_error(response: Any):
+        """Fail closed on Modbus exception responses."""
+
+        if response is None:
+            raise ModbusException("No response from Modbus device")
+        if hasattr(response, "isError") and response.isError():
+            raise ModbusException(str(response))
+
+    @classmethod
+    def _get_checked_registers(cls, response: Any, start: int, count: int) -> List[int]:
+        """Validate a read response and return its registers."""
+
+        cls._raise_for_modbus_error(response)
+        registers = getattr(response, "registers", None)
+        if registers is None:
+            raise ModbusException("Modbus read response did not include registers")
+        if len(registers) != count:
+            raise ModbusException(
+                f"Modbus read returned {len(registers)} registers for "
+                f"{count} requested at {start}"
+            )
+        return list(registers)
+
+    @classmethod
+    def _check_write_response(cls, response: Any, start: int, count: int):
+        """Validate a function-16 write acknowledgement."""
+
+        cls._raise_for_modbus_error(response)
+        address = getattr(response, "address", start)
+        written_count = getattr(response, "count", count)
+        if address != start or written_count != count:
+            raise ModbusException(
+                "Modbus write acknowledgement did not match requested address/count"
+            )
+
+    def _run_with_constraints(
+        self, func: Callable[[int, int], Any], start: int, count: int
+    ) -> List[int]:
+        """Validate range, execute command, and check the response."""
+
+        self._validate_read_register_range(start, count)
+        logger.debug("Modbus read start=%s count=%s", start, count)
+        response = func(start, count)
+        registers = self._get_checked_registers(response, start, count)
+        logger.debug(
+            "Modbus read completed start=%s count=%s registers=%s",
+            start,
+            count,
+            registers,
+        )
+        return registers
+
+    def _run_write_with_constraints(
+        self, func: Callable[[int, List[int]], Any], start: int, values: List[int]
+    ):
+        """Validate write range, execute command, and check the acknowledgement."""
 
         count = len(values)
-        self._validate_register_window(start, count)
-        self._wait_for_min_period()
-        try:
-            return func(start, values)
-        finally:
-            self._last_cmd_time = perf_counter()
+        self._validate_write_register_range(start, count)
+        self._validate_register_values(values)
+        logger.debug("Modbus write start=%s count=%s values=%s", start, count, values)
+        response = func(start, values)
+        self._check_write_response(response, start, count)
+        logger.debug("Modbus write acknowledged start=%s count=%s", start, count)
+        return response
 
     def connect(self):
         """Connect to the Modbus server."""
-        with self._lock:
-            self._client.connect()
+        self._connect_locked()
 
     def close(self):
         """Close the connection to the Modbus server."""
-        with self._lock:
-            self._client.close()
+        logger.info("Closing Modbus serial port port=%s", self._port)
+        self._client.close()
 
     def read_input_registers(self, start: int, count: int):
         """Read input registers from the Modbus server."""
-        with self._lock:
-            return self._run_with_constraints(
+        logger.debug("Reading input registers start=%s count=%s", start, count)
+        self.wait_until_ready_for_operation()
+        return self._with_recovery_locked(
+            lambda: self._run_with_constraints(
                 self._client.read_input_registers, start, count
             )
+        )
 
     def read_holding_registers(self, start: int, count: int = 1):
         """Read holding registers from the Modbus server."""
-        with self._lock:
-            return self._run_with_constraints(
+        logger.debug("Reading holding registers start=%s count=%s", start, count)
+        self.wait_until_ready_for_operation()
+        return self._with_recovery_locked(
+            lambda: self._run_with_constraints(
                 self._client.read_holding_registers, start, count
             )
-
-    def write_registers_unsafe(self, address: int, values: List[int]):
-        """Write multiple registers to the Modbus server without enforcing any
-        constraints; i.e. without locking or minimum wait time between commands."""
-        return self._client.write_registers(address, values)
+        )
 
     def write_registers(self, address: int, values: List[int]):
         """Write multiple registers to the Modbus server."""
-        with self._lock:
-            return self._run_write_with_constraints(
+        logger.debug(
+            "Writing holding registers start=%s count=%s values=%s",
+            address,
+            len(values),
+            values,
+        )
+        self.wait_until_ready_for_operation()
+        return self._with_recovery_locked(
+            lambda: self._run_write_with_constraints(
                 self._client.write_registers, address, values
             )
+        )
 
 
-def _build_register_windows(registers: Dict[str, tuple]) -> List[tuple[int, int]]:
-    """Compute the minimal set of 45-word windows covering given registers."""
+def _build_register_windows(
+    registers: Dict[str, tuple],
+    max_window_registers: int = GrowattModbusClient.MAX_DEVICE_READ_REGISTERS,
+) -> List[tuple[int, int]]:
+    """Compute minimal read windows covering populated register ranges."""
 
-    windows = {}
-    for start, length, *_ in registers.values():
-        block = start // GrowattModbusClient.MAX_WORDS_PER_CMD
+    windows: List[List[int]] = []
+    for start, length, *_ in sorted(registers.values(), key=lambda x: x[0]):
         end = start + length - 1
-        if block not in windows:
-            windows[block] = [start, end]
+        if (
+            windows
+            and max(windows[-1][1], end) - min(windows[-1][0], start) + 1
+            <= GrowattModbusClient.MAX_READ_REGISTERS
+        ):
+            windows[-1][0] = min(windows[-1][0], start)
+            windows[-1][1] = max(windows[-1][1], end)
         else:
-            windows[block][0] = min(windows[block][0], start)
-            windows[block][1] = max(windows[block][1], end)
+            windows.append([start, end])
 
-    return [
-        (start, end - start + 1)
-        for start, end in sorted(windows.values(), key=lambda x: x[0])
-    ]
+    split_windows: List[tuple[int, int]] = []
+    for start, end in sorted(windows, key=lambda x: x[0]):
+        current = start
+        while current <= end:
+            count = min(max_window_registers, end - current + 1)
+            split_windows.append((current, count))
+            current += count
+    return split_windows
 
 
-INPUT_REGISTER_WINDOWS = _build_register_windows(InputRegisters)
-HOLDING_REGISTER_WINDOWS = _build_register_windows(HoldingAndWriteRegisters)
+INPUT_REGISTER_WINDOWS = _build_register_windows(INPUT_REGISTERS)
+HOLDING_REGISTER_WINDOWS = _build_register_windows(HOLDING_AND_WRITE_REGISTERS)
 
 
-class GrowattInverter:
+@dataclass
+class ModbusAppConfig:  # pylint: disable=too-many-instance-attributes
+    """Modbus runtime configuration."""
+
+    port: str
+    write_queue_size: int
+    write_batch_delay_sec: float
+    timeout_sec: float
+    retries: int
+    reconnect_delay_sec: float
+
+
+class GrowattInverter:  # pylint: disable=too-many-instance-attributes
     """Class to interact with a Growatt inverter using Modbus RTU."""
 
-    def __init__(self, port: str):
+    CONFIG_WRITE_SETTLE_DELAY_SEC = 0.85
+
+    def __init__(self, config: ModbusAppConfig):
         """Initialize the Growatt inverter.
 
         Args:
-            port (str): The serial port to use (e.g. "/dev/ttyUSB0")."""
-        self.client = GrowattModbusClient(port)
-        self.sync_time_thread = Thread(target=self.sync_time)
-        self.sync_time_event = Event()
-        self.write_queue = Queue()
-        self.write_thread = Thread(target=self.write_registers)
-        self.write_event = Event()
+            config (ModbusAppConfig): Modbus runtime configuration."""
+        self.client = GrowattModbusClient(
+            config.port,
+            timeout_sec=config.timeout_sec,
+            retries=config.retries,
+            reconnect_delay_sec=config.reconnect_delay_sec,
+        )
+        self.write_batch_delay_sec = max(0.0, config.write_batch_delay_sec)
+        self._write_queue: deque[tuple[int, List[int]]] = deque()
+        self._write_queue_size = max(1, config.write_queue_size)
+        self._next_write_flush: Optional[float] = None
+        self._sync_time_interval_sec = 720.0
+        self._next_sync_time: Optional[float] = None
+        self._lock = RLock()
+        logger.info(
+            "Growatt inverter initialized write_queue_size=%s write_batch_delay_sec=%s",
+            self._write_queue_size,
+            self.write_batch_delay_sec,
+        )
 
     def connect(self):
-        """Connect to the Modbus server and start the datetime thread."""
+        """Connect to the Modbus server and schedule maintenance work."""
+        logger.info("Connecting inverter")
         self.client.connect()
-        if not self.sync_time_thread.is_alive():
-            self.sync_time_thread.start()
-        if not self.write_thread.is_alive():
-            self.write_thread.start()
+        self._next_sync_time = perf_counter()
+        logger.info("Inverter connected; initial time sync scheduled")
 
     def close(self):
-        """Close the connection to the Modbus server and stop the datetime thread."""
+        """Close the connection to the Modbus server."""
+        logger.info("Closing inverter")
         self.client.close()
-        self.sync_time_event.set()
-        if self.sync_time_thread.is_alive():
-            self.sync_time_thread.join()
-        self.write_event.set()
-        if self.write_thread.is_alive():
-            self.write_thread.join()
 
-    def sync_time(self):
-        """Update the inverter's time every 720 seconds."""
-        update_interval = 720  # seconds
-        while True:
-            try:
-                self.client._lock.acquire()  # pylint: disable=consider-using-with
-                sleep(int(time() + 1) - time())  # Wait until the next exact second
-                now = datetime.now()
-                values = [
-                    now.year,  # SysYear (45)
-                    now.month,  # SysMonth (46)
-                    now.day,  # SysDay (47)
-                    now.hour,  # SysHour (48)
-                    now.minute,  # SysMin (49)
-                    now.second,  # SysSec (50)
-                ]
-                self.client.write_registers_unsafe(
-                    HoldingAndWriteRegisters["SysYear"][0],  # 45
-                    values=values,  # [year, month, day, hour, minute, second]
+    def sync_time(self) -> Optional[List[int]]:
+        """Write the current local wall clock to the inverter."""
+
+        with self._lock:
+            self.client.wait_until_ready_for_operation()
+            now = datetime.now()
+            wait_sec = 1.0 - (now.microsecond / 1_000_000.0)
+            if wait_sec > 0.0:
+                logger.debug(
+                    "Waiting for next second boundary before time sync wait_sec=%.6f",
+                    wait_sec,
                 )
+                sleep(wait_sec)
+                now = datetime.now()
+
+            values = [
+                now.year,  # SysYear (45)
+                now.month,  # SysMonth (46)
+                now.day,  # SysDay (47)
+                now.hour,  # SysHour (48)
+                now.minute,  # SysMin (49)
+                now.second,  # SysSec (50)
+            ]
+            try:
+                logger.info("Syncing inverter time values=%s", values)
+                self.client.write_registers(
+                    HOLDING_AND_WRITE_REGISTERS["SysYear"][0],  # 45
+                    values,
+                )
+                logger.info("Inverter time sync completed values=%s", values)
+                return values
             except Exception as exc:  # pylint: disable=broad-except
-                sys.stderr.write(f"[ERROR] Failed to update time: {exc}\n")
+                logger.error("Failed to update time: %s", exc)
+                return None
             finally:
-                sleep(self.client.MIN_WAIT_TIME_BETWEEN_CMDS)
-                self.client._lock.release()
+                self._next_sync_time = perf_counter() + self._sync_time_interval_sec
+                logger.info(
+                    "Next inverter time sync scheduled interval_sec=%s",
+                    self._sync_time_interval_sec,
+                )
 
-            if self.sync_time_event.wait(timeout=update_interval):
-                break
+    @staticmethod
+    def _coalesce_writes(
+        requested: Dict[int, List[int]],
+    ) -> List[tuple[int, List[int]]]:
+        """Merge adjacent pending writes into legal Modbus function-16 frames."""
 
-    def write_registers(self):
-        """Write registers to the inverter from queue every second."""
-        update_interval = 1  # seconds
-        while not self.write_event.wait(timeout=update_interval):
+        if not requested:
+            return []
+
+        words = {}
+        for start, values in requested.items():
+            for offset, value in enumerate(values):
+                words[start + offset] = value
+
+        batches: List[tuple[int, List[int]]] = []
+        batch_start: Optional[int] = None
+        batch_values: List[int] = []
+        previous_address: Optional[int] = None
+
+        for address, value in sorted(words.items()):
+            can_extend = (
+                batch_start is not None
+                and previous_address is not None
+                and address == previous_address + 1
+                and len(batch_values) < GrowattModbusClient.MAX_WRITE_REGISTERS
+            )
+            if not can_extend:
+                if batch_start is not None:
+                    batches.append((batch_start, batch_values))
+                batch_start = address
+                batch_values = [value]
+            else:
+                batch_values.append(value)
+            previous_address = address
+
+        if batch_start is not None:
+            batches.append((batch_start, batch_values))
+
+        logger.debug(
+            "Coalesced config writes requests=%s batches=%s",
+            len(requested),
+            len(batches),
+        )
+        return batches
+
+    def flush_pending_writes(self):
+        """Write queued register updates, coalescing nearby requests."""
+
+        with self._lock:
+            if not self._write_queue:
+                self._next_write_flush = None
+                logger.debug("No pending config writes to flush")
+                return
+
             requested = {}
-            while not self.write_queue.empty():
-                start, values = self.write_queue.get_nowait()
+            while self._write_queue:
+                start, values = self._write_queue.popleft()
                 requested[start] = values
+            self._next_write_flush = None
+            batches = self._coalesce_writes(requested)
+            failed_batches = 0
 
-            for start, values in requested.items():
+            for start, values in batches:
                 try:
                     self.client.write_registers(start, values)
+                    logger.debug(
+                        "Config write flushed start=%s count=%s values=%s",
+                        start,
+                        len(values),
+                        values,
+                    )
                 except Exception as exc:  # pylint: disable=broad-except
-                    sys.stderr.write(f"[ERROR] Failed to write registers: {exc}\n")
+                    logger.error(
+                        "Failed to write registers start=%s count=%s: %s",
+                        start,
+                        len(values),
+                        exc,
+                    )
+                    failed_batches += 1
+                finally:
+                    self.client.defer_next_operations(
+                        self.CONFIG_WRITE_SETTLE_DELAY_SEC
+                    )
+
+            if failed_batches:
+                logger.warning(
+                    "Config write flush completed with failures requests=%s batches=%s failed=%s",
+                    len(requested),
+                    len(batches),
+                    failed_batches,
+                )
+            else:
+                logger.info(
+                    "Config writes flushed requests=%s batches=%s",
+                    len(requested),
+                    len(batches),
+                )
+
+    def run_maintenance(self):
+        """Run scheduled inverter work from the HTTP selector loop."""
+
+        with self._lock:
+            now = perf_counter()
+            if self._next_write_flush is not None and now >= self._next_write_flush:
+                logger.debug("Maintenance flushing due config writes")
+                self.flush_pending_writes()
+            if self._next_sync_time is not None and now >= self._next_sync_time:
+                logger.debug("Maintenance syncing inverter time")
+                self.sync_time()
+
+    def next_maintenance_timeout(self) -> Optional[float]:
+        """Return seconds until the next scheduled inverter task."""
+
+        with self._lock:
+            now = perf_counter()
+            timeouts = [
+                deadline - now
+                for deadline in (self._next_write_flush, self._next_sync_time)
+                if deadline is not None
+            ]
+            if not timeouts:
+                logger.debug("No scheduled maintenance timeout")
+                return None
+            timeout = max(0.0, min(timeouts))
+            logger.debug("Next maintenance timeout timeout_sec=%s", timeout)
+            return timeout
 
     def _read_register_windows(
-        self, reader, windows: List[tuple[int, int]]
+        self, reader: Callable[[int, int], List[int]], windows: List[tuple[int, int]]
     ) -> List[int]:
-        """Read only the populated 45-word windows and place them in a single buffer."""
+        """Read populated register windows and place them in a single buffer."""
 
         if not windows:
             return []
@@ -522,8 +1063,8 @@ class GrowattInverter:
         max_end = max(start + count for start, count in windows)
         registers: List[int] = [0] * max_end
         for start, count in windows:
-            response = reader(start, count)
-            registers[start : start + count] = response.registers
+            logger.debug("Reading register window start=%s count=%s", start, count)
+            registers[start : start + count] = reader(start, count)
 
         return registers
 
@@ -538,8 +1079,8 @@ class GrowattInverter:
             start (int): The start index of the registers.
             length (int): The number of registers to convert."""
         return b"".join(
-            bytes([registers[start + i] >> 8, registers[start + i] & 0xFF])
-            for i in range(length)
+            register.to_bytes(2, "big")
+            for register in registers[start : start + length]
         )
 
     @staticmethod
@@ -611,68 +1152,122 @@ class GrowattInverter:
             case _:
                 raise ValueError("Invalid register type")
 
+    @staticmethod
+    def _postprocess_register_value(key: str, value: Any, postprocess: Callable):
+        """Apply a register postprocessor and normalize malformed device values."""
+
+        try:
+            return postprocess(value)
+        except (KeyError, ValueError, UnicodeDecodeError) as exc:
+            raise ModbusException(
+                f"Unexpected value for register {key}: {value!r}"
+            ) from exc
+
     def read_status(self):
         """Read the system status and other information from the inverter."""
-        reg = self._read_register_windows(
-            self.client.read_input_registers, INPUT_REGISTER_WINDOWS
-        )
-        info = {}
-        for key, value in InputRegisters.items():
-            start, length, type_, postprocess = value
-            info[key] = self.generic_read_postprocess(reg, start, length, type_)
-            info[key] = postprocess(info[key])
+        with self._lock:
+            logger.debug("Reading inverter status")
+            reg = self._read_register_windows(
+                self.client.read_input_registers, INPUT_REGISTER_WINDOWS
+            )
+            info = {}
+            for key, value in INPUT_REGISTERS.items():
+                start, length, type_, postprocess = value
+                raw_value = self.generic_read_postprocess(reg, start, length, type_)
+                info[key] = self._postprocess_register_value(
+                    key, raw_value, postprocess
+                )
 
-        return info
+            logger.debug("Completed inverter status read fields=%s", len(info))
+            return info
 
     def read_config(self):
         """Read the system configuration from the inverter."""
-        reg = self._read_register_windows(
-            self.client.read_holding_registers, HOLDING_REGISTER_WINDOWS
-        )
-        info = {}
-        for key, value in HoldingAndWriteRegisters.items():
-            start, length, type_, readpostprocess, _ = value
-            info[key] = self.generic_read_postprocess(reg, start, length, type_)
-            info[key] = readpostprocess(info[key])
+        with self._lock:
+            logger.debug("Reading inverter config")
+            reg = self._read_register_windows(
+                self.client.read_holding_registers, HOLDING_REGISTER_WINDOWS
+            )
+            info = {}
+            for key, value in HOLDING_AND_WRITE_REGISTERS.items():
+                start, length, type_, readpostprocess, _ = value
+                raw_value = self.generic_read_postprocess(reg, start, length, type_)
+                info[key] = self._postprocess_register_value(
+                    key, raw_value, readpostprocess
+                )
 
-        return info
+            logger.debug("Completed inverter config read fields=%s", len(info))
+            return info
 
     def write_config(self, key: str, value: Union[str, int, float]):
-        """Schedule a config write to the inverter to be processed by the write thread.
+        """Schedule a config write for the selector-loop maintenance hook.
 
         Args:
             key (str): The configuration key to write.
             value (Union[str, int, float]): The value to write."""
-        try:
-            start, length, type_, _, writepreprocess = HoldingAndWriteRegisters[key]
-        except KeyError as exc:
-            raise KeyError("Invalid key") from exc
-        if not writepreprocess:
-            raise ValueError("Register is not writeable")
-
-        try:
-            value = writepreprocess(value)
-        except (ValueError, KeyError) as exc:
-            raise ValueError("Invalid value") from exc
-
-        match type_:
-            case RegType.UINT | RegType.INT:
-                values = self.uncombine_registers(
-                    value, length, signed=type_ == RegType.INT
-                )
-            case RegType.CHAR:
-                values = list(value.encode("utf-8"))
-                values = [
-                    values[i] << 8 | values[i + 1] if i + 1 < len(values) else values[i]
-                    for i in range(0, len(values), 2)
+        with self._lock:
+            try:
+                start, length, type_, _, writepreprocess = HOLDING_AND_WRITE_REGISTERS[
+                    key
                 ]
-                values += [0] * (length - len(values))  # pad with zeros
-                if len(values) != length:
-                    raise ValueError("Invalid value length")
-            case _:
-                raise ValueError("Invalid register type")
+            except KeyError as exc:
+                logger.warning("Rejected config write with invalid key key=%s", key)
+                raise KeyError("Invalid key") from exc
+            if not writepreprocess:
+                logger.warning("Rejected write to read-only config key=%s", key)
+                raise ValueError("Register is not writeable")
 
-        self.write_queue.put((start, values))
+            try:
+                value = writepreprocess(value)
+            except (ValueError, KeyError, OverflowError) as exc:
+                logger.warning("Rejected config write with invalid value key=%s", key)
+                raise ValueError("Invalid value") from exc
+
+            match type_:
+                case RegType.UINT | RegType.INT:
+                    try:
+                        values = self.uncombine_registers(
+                            value, length, signed=type_ == RegType.INT
+                        )
+                    except OverflowError as exc:
+                        raise ValueError("Invalid value") from exc
+                case RegType.CHAR:
+                    values = list(value.encode("utf-8"))
+                    values = [
+                        values[i] << 8 | values[i + 1]
+                        if i + 1 < len(values)
+                        else values[i]
+                        for i in range(0, len(values), 2)
+                    ]
+                    values += [0] * (length - len(values))  # pad with zeros
+                    if len(values) != length:
+                        raise ValueError("Invalid value length")
+                case _:
+                    raise ValueError("Invalid register type")
+
+            if len(self._write_queue) >= self._write_queue_size:
+                logger.warning(
+                    "Rejected config write because queue is full key=%s queue_size=%s",
+                    key,
+                    self._write_queue_size,
+                )
+                raise WriteQueueFullError("Write queue is full")
+
+            self._write_queue.append((start, values))
+            logger.debug(
+                "Queued config write key=%s start=%s count=%s values=%s queue_depth=%s",
+                key,
+                start,
+                len(values),
+                values,
+                len(self._write_queue),
+            )
+            if self._next_write_flush is None:
+                self._next_write_flush = perf_counter() + self.write_batch_delay_sec
+                logger.debug(
+                    "Scheduled config write flush delay_sec=%s",
+                    self.write_batch_delay_sec,
+                )
 
 
 @dataclass
@@ -684,20 +1279,29 @@ class GrowattHTTPAuth:
     password_salt: str
 
 
-class GrowattHTTPHandler(BaseHTTPRequestHandler):
+@dataclass
+class GrowattHTTPConfig:
+    """HTTP handler runtime configuration."""
+
+    timeout: int
+    json_indent: Optional[int]
+    x_forwarded_for: bool
+    auth: GrowattHTTPAuth
+
+
+class GrowattHTTPHandler(BaseHTTPRequestHandler):  # pylint: disable=too-many-public-methods
     """
     HTTP request handler for the Growatt inverter.
     """
 
+    protocol_version = "HTTP/1.1"
     server_version = ""
     sys_version = ""
 
     def __init__(
         self,
         inverter: GrowattInverter,
-        timeout: int,
-        x_forwarded_for: bool,
-        auth: GrowattHTTPAuth,
+        http_config: GrowattHTTPConfig,
         *args,
         **kwargs,
     ):
@@ -705,40 +1309,88 @@ class GrowattHTTPHandler(BaseHTTPRequestHandler):
 
         Args:
             inverter (GrowattInverter): The Growatt inverter.
-            timeout (int): The timeout in seconds for the request.
-            x_forwarded_for (bool): Whether to use the X-Forwarded-For header.
-            auth (GrowattHTTPAuth): The authentication data.
+            http_config (GrowattHTTPConfig): HTTP handler configuration.
             *args: Passed to the BaseHTTPRequestHandler constructor.
             **kwargs: Passed to the BaseHTTPRequestHandler constructor."""
         self.inverter = inverter
-        self.timeout = timeout
-        self.x_forwarded_for = x_forwarded_for
-        self.auth = auth
+        self.http_config = http_config
+        self.close_connection = True
         super().__init__(*args, **kwargs)
 
     @override
+    def setup(self):
+        """Initialize the request socket and apply the configured timeout."""
+
+        super().setup()
+        self.connection.settimeout(self.http_config.timeout)
+
+    @override
     def handle(self):
-        """Handle multiple requests if necessary but catch ConnectionResetError."""
+        """Handle multiple requests while ignoring common client disconnects."""
         try:
             super().handle()
-        except ConnectionResetError:
-            pass
+        except (ConnectionResetError, BrokenPipeError, SocketTimeout):
+            logger.debug(
+                "HTTP client disconnected early client=%s",
+                self.client_address,
+            )
 
     @override
     def address_string(self) -> str:
         """Return the client address with X-Forwarded-For support."""
         if (
-            self.x_forwarded_for
+            self.http_config.x_forwarded_for
             and hasattr(self, "headers")
             and "X-Forwarded-For" in self.headers
         ):
-            return self.headers["X-Forwarded-For"]
+            forwarded_for = self.headers["X-Forwarded-For"].split(",", 1)[0]
+            return self.sanitize_log_value(forwarded_for)
         return super().address_string()
 
     @override
     def version_string(self):
         """Return the server software version string."""
         return "Growatt/1.0"
+
+    @override
+    def log_request(self, code: Union[int, str] = "-", size: Union[int, str] = "-"):
+        """Log requests without query strings, which can contain write values."""
+
+        path = self.sanitize_log_value(urlsplit(self.path).path)
+        self.log_message(
+            '"%s %s %s" %s %s',
+            self.command,
+            path,
+            self.request_version,
+            code,
+            size,
+        )
+
+    @override
+    def log_message(self, format: str, *args):  # pylint: disable=redefined-builtin
+        """Route BaseHTTPRequestHandler logs through the module logger."""
+
+        logger.debug(
+            "%s - %s",
+            self.address_string(),
+            self.sanitize_log_value(format % args),
+        )
+
+    @override
+    def log_error(self, format: str, *args):  # pylint: disable=redefined-builtin
+        """Route BaseHTTPRequestHandler errors through the module logger."""
+
+        logger.error(
+            "%s - %s",
+            self.address_string(),
+            self.sanitize_log_value(format % args),
+        )
+
+    @staticmethod
+    def sanitize_log_value(value: str) -> str:
+        """Remove control characters from values written to logs."""
+
+        return "".join(char if char.isprintable() else "?" for char in value).strip()
 
     @staticmethod
     def hash_password(password: str, salt: str) -> str:
@@ -757,15 +1409,56 @@ class GrowattHTTPHandler(BaseHTTPRequestHandler):
             headers (Dict[str, str]): The response headers.
             body (Optional[bytes]): The response body.
         """
+        if body is None:
+            body = b""
+
+        explicit_connection = headers.get("Connection", "").lower()
+        if explicit_connection == "close":
+            self.close_connection = True
+        else:
+            self._set_connection_policy()
         self.send_response(code)
+        if "Cache-Control" not in headers:
+            self.send_header("Cache-Control", "no-store")
         for key, value in headers.items():
             self.send_header(key, value)
         self.send_header("Content-Length", str(len(body)))
         if "Connection" not in headers:
-            self.send_header("Connection", "close")
+            connection = "keep-alive" if self._should_keep_alive() else "close"
+            self.send_header("Connection", connection)
         self.end_headers()
         if body and self.command != "HEAD":
             self.wfile.write(body)
+        logger.debug(
+            "Sent HTTP response method=%s path=%s code=%s bytes=%s close=%s",
+            self.command,
+            self.sanitize_log_value(urlsplit(self.path).path),
+            code,
+            len(body),
+            self.close_connection,
+        )
+
+    def _should_keep_alive(self) -> bool:
+        """Return whether this request may keep the TCP connection open."""
+
+        # A single-threaded HTTP handler must not let an idle keep-alive client
+        # monopolize the event loop after a response.
+        return False
+
+    def _set_connection_policy(self):
+        """Tell BaseHTTPRequestHandler whether another request is expected."""
+
+        self.close_connection = not self._should_keep_alive()
+
+    def send_json_response(self, code: int, data: Any):
+        """Serialize and send a JSON response."""
+
+        body = json_dumps(
+            data,
+            indent=self.http_config.json_indent,
+            separators=None if self.http_config.json_indent is not None else (",", ":"),
+        ).encode("utf-8")
+        self.send_final_response(code, {"Content-Type": CONTENT_TYPE_JSON}, body)
 
     @override
     def send_error(
@@ -794,24 +1487,22 @@ class GrowattHTTPHandler(BaseHTTPRequestHandler):
         # Message body is omitted for cases described in:
         #  - RFC7230: 3.3. 1xx, 204(No Content), 304(Not Modified)
         #  - RFC7231: 6.3.6. 205(Reset Content)
-        body = None
         if code >= 200 and code not in (
             HTTPStatus.NO_CONTENT,
             HTTPStatus.RESET_CONTENT,
             HTTPStatus.NOT_MODIFIED,
         ):
-            content = {
-                "code": code,
-                "message": message,
-                "explain": explain,
-            }
-            body = json_dumps(content, indent=4).encode("utf-8")
+            self.send_json_response(
+                code,
+                {
+                    "code": code,
+                    "message": message,
+                    "explain": explain,
+                },
+            )
+            return
 
-        self.send_final_response(
-            code,
-            {"Content-Type": CONTENT_TYPE_JSON},
-            body,
-        )
+        self.send_final_response(code, {"Content-Type": CONTENT_TYPE_JSON}, None)
 
     def check_auth(self, username: str, password: str) -> bool:
         """Validates the password against the stored hash.
@@ -819,11 +1510,16 @@ class GrowattHTTPHandler(BaseHTTPRequestHandler):
         Args:
             username (str): The username.
             password (str): The password."""
-        return (
-            username == self.auth.username
-            and GrowattHTTPHandler.hash_password(password, self.auth.password_salt)
-            == self.auth.password_hash
+        password_hash = GrowattHTTPHandler.hash_password(
+            password,
+            self.http_config.auth.password_salt,
         )
+        username_matches = hmac.compare_digest(username, self.http_config.auth.username)
+        password_matches = hmac.compare_digest(
+            password_hash,
+            self.http_config.auth.password_hash,
+        )
+        return username_matches and password_matches
 
     def validate_basic_auth_header(self, authorization_header: str) -> bool:
         """Validate the Authorization header.
@@ -831,20 +1527,24 @@ class GrowattHTTPHandler(BaseHTTPRequestHandler):
         Args:
             authorization_header (str): The Authorization header."""
         try:
+            if len(authorization_header) > MAX_AUTH_HEADER_LENGTH:
+                return False
             auth_type, auth_string = authorization_header.split(" ", 1)
             if auth_type.lower() != "basic":
                 return False
-            auth_string = base64.b64decode(auth_string).decode("utf-8")
+            auth_string = base64.b64decode(auth_string, validate=True).decode("utf-8")
             if ":" not in auth_string:
                 return False
             return self.check_auth(*auth_string.split(":", 1))
-        except binascii.Error:
+        except (binascii.Error, UnicodeDecodeError, ValueError):
+            logger.warning("Rejected malformed Authorization header")
             return False
 
     @staticmethod
     def auth_required(func):
         """Decorator to require Basic authentication."""
 
+        @wraps(func)
         def wrapper(self: "GrowattHTTPHandler", *args, **kwargs):
             """Wrapper function."""
             if (
@@ -852,13 +1552,26 @@ class GrowattHTTPHandler(BaseHTTPRequestHandler):
                 and "Authorization" in self.headers
                 and self.validate_basic_auth_header(self.headers["Authorization"])
             ):
+                logger.debug(
+                    "HTTP authentication succeeded method=%s path=%s",
+                    getattr(self, "command", "-"),
+                    self.sanitize_log_value(urlsplit(getattr(self, "path", "")).path),
+                )
                 return func(self, *args, **kwargs)
 
+            logger.warning(
+                "HTTP authentication failed method=%s path=%s client=%s",
+                getattr(self, "command", "-"),
+                self.sanitize_log_value(urlsplit(getattr(self, "path", "")).path),
+                getattr(self, "client_address", "-"),
+            )
+            sleep(0.15)
             self.send_final_response(
                 HTTPStatus.UNAUTHORIZED,
                 {
                     "Content-Type": CONTENT_TYPE_TEXT,
-                    "WWW-Authenticate": 'Basic realm="Growatt"',
+                    "WWW-Authenticate": 'Basic realm="Growatt", charset="UTF-8"',
+                    "Connection": "close",
                 },
                 b"Unauthorized",
             )
@@ -871,10 +1584,16 @@ class GrowattHTTPHandler(BaseHTTPRequestHandler):
 
         Returns:
             Tuple[str, Dict[str, List[str]]]: The path and query string."""
-        path = self.path.split("?")
-        qs = parse_qs(path[1]) if len(path) > 1 else {}
-        path = path[0]  # ignore query string
-        return path, qs
+        parsed = urlsplit(self.path)
+        if len(parsed.query) > MAX_QUERY_LENGTH:
+            logger.warning("Rejected oversized query path=%s", parsed.path)
+            raise ValueError("Query string too long")
+        logger.debug("Parsed HTTP path path=%s", parsed.path)
+        return parsed.path, parse_qs(
+            parsed.query,
+            keep_blank_values=False,
+            max_num_fields=MAX_QUERY_FIELDS,
+        )
 
     @auth_required
     @override
@@ -882,16 +1601,69 @@ class GrowattHTTPHandler(BaseHTTPRequestHandler):
         """Handle HEAD requests."""
         self.do_GET()
 
+    def reject_unsupported_method(self):
+        """Reject authenticated but unsupported HTTP methods."""
+
+        self.send_final_response(
+            HTTPStatus.METHOD_NOT_ALLOWED,
+            {
+                "Content-Type": CONTENT_TYPE_TEXT,
+                "Allow": "GET, HEAD, PUT",
+            },
+            b"Method Not Allowed",
+        )
+        logger.warning("Rejected unsupported HTTP method method=%s", self.command)
+
+    @auth_required
+    @override
+    def do_POST(self):  # pylint: disable=invalid-name
+        """Handle unsupported POST requests."""
+        self.reject_unsupported_method()
+
+    @auth_required
+    @override
+    def do_DELETE(self):  # pylint: disable=invalid-name
+        """Handle unsupported DELETE requests."""
+        self.reject_unsupported_method()
+
+    @auth_required
+    @override
+    def do_PATCH(self):  # pylint: disable=invalid-name
+        """Handle unsupported PATCH requests."""
+        self.reject_unsupported_method()
+
+    @auth_required
+    @override
+    def do_OPTIONS(self):  # pylint: disable=invalid-name
+        """Handle unsupported OPTIONS requests."""
+        self.reject_unsupported_method()
+
+    @auth_required
+    @override
+    def do_TRACE(self):  # pylint: disable=invalid-name
+        """Handle unsupported TRACE requests."""
+        self.reject_unsupported_method()
+
     @auth_required
     @override
     def do_GET(self):  # pylint: disable=invalid-name
         """Handle GET requests."""
-        path, qs = self.parse_path_qs()
+        logger.debug(
+            "Handling HTTP GET path=%s",
+            self.sanitize_log_value(urlsplit(self.path).path),
+        )
+        try:
+            path, qs = self.parse_path_qs()
+        except ValueError as exc:
+            self.send_error(HTTPStatus.URI_TOO_LONG, str(exc))
+            return
 
         if "_method" in qs:
             match method := qs["_method"][0].upper():
                 case "PUT":
+                    logger.info("HTTP GET method override to PUT path=%s", path)
                     self.do_PUT()
+                    return
                 case "GET":
                     pass  # continue with GET
                 case "HEAD":
@@ -915,26 +1687,16 @@ class GrowattHTTPHandler(BaseHTTPRequestHandler):
                 )
             case "/status":
                 try:
-                    self.send_final_response(
-                        HTTPStatus.OK,
-                        {"Content-Type": CONTENT_TYPE_JSON},
-                        json_dumps(self.inverter.read_status(), indent=4).encode(
-                            "utf-8"
-                        ),
-                    )
+                    self.send_json_response(HTTPStatus.OK, self.inverter.read_status())
                 except ModbusException as exc:
-                    self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR, str(exc))
+                    logger.error("Status request failed: %s", exc)
+                    self.send_error(HTTPStatus.BAD_GATEWAY, str(exc))
             case "/config":
                 try:
-                    self.send_final_response(
-                        HTTPStatus.OK,
-                        {"Content-Type": CONTENT_TYPE_JSON},
-                        json_dumps(self.inverter.read_config(), indent=4).encode(
-                            "utf-8"
-                        ),
-                    )
+                    self.send_json_response(HTTPStatus.OK, self.inverter.read_config())
                 except ModbusException as exc:
-                    self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR, str(exc))
+                    logger.error("Config request failed: %s", exc)
+                    self.send_error(HTTPStatus.BAD_GATEWAY, str(exc))
             case _:
                 self.send_error(HTTPStatus.NOT_FOUND, "Not Found")
 
@@ -942,111 +1704,212 @@ class GrowattHTTPHandler(BaseHTTPRequestHandler):
     @override
     def do_PUT(self):  # pylint: disable=invalid-name
         """Handle PUT requests."""
-        path, qs = self.parse_path_qs()
+        logger.debug(
+            "Handling HTTP PUT path=%s",
+            self.sanitize_log_value(urlsplit(self.path).path),
+        )
+        try:
+            path, qs = self.parse_path_qs()
+        except ValueError as exc:
+            self.send_error(HTTPStatus.URI_TOO_LONG, str(exc))
+            return
+
+        if path == "/time-sync":
+            values = self.inverter.sync_time()
+            if values is None:
+                logger.error("Forced time sync failed")
+                self.send_error(
+                    HTTPStatus.BAD_GATEWAY,
+                    "Failed to update inverter time",
+                )
+                return
+            logger.info("Forced time sync completed values=%s", values)
+            self.send_json_response(
+                HTTPStatus.OK,
+                {
+                    "status": "OK",
+                    "values": values,
+                },
+            )
+            return
 
         if path != "/config":
+            logger.warning("Rejected config write on invalid path path=%s", path)
             self.send_error(HTTPStatus.NOT_FOUND, "Not Found")
             return
 
         if "key" not in qs or "value" not in qs:
+            logger.warning("Rejected config write with missing query fields")
             self.send_error(HTTPStatus.BAD_REQUEST, "Invalid query")
             return
 
         key = qs["key"][0]
-        value = qs["value"][0]
-
         try:
-            value = float(value)
+            value = parse_config_value(qs["value"][0])
         except ValueError:
-            pass  # allow string value if conversion fails
-
-        try:
-            value_int = int(value)
-            if abs(value_int - value) < 1e-3:
-                value = value_int
-        except ValueError:
-            pass  # allow float value if conversion fails
+            logger.warning("Rejected config write with unparsable value key=%s", key)
+            self.send_error(HTTPStatus.BAD_REQUEST, "Invalid value")
+            return
 
         try:
             self.inverter.write_config(key, value)
+            logger.debug("Accepted config write request key=%s", key)
             self.send_final_response(
                 HTTPStatus.OK,
                 {"Content-Type": CONTENT_TYPE_TEXT},
                 b"OK",
             )
         except (KeyError, ValueError) as exc:
+            logger.warning("Rejected config write key=%s error=%s", key, exc)
             self.send_error(HTTPStatus.BAD_REQUEST, str(exc))
+        except WriteQueueFullError as exc:
+            logger.warning("Config write queue full key=%s", key)
+            self.send_error(HTTPStatus.SERVICE_UNAVAILABLE, str(exc))
         except ModbusException as exc:
-            self.send_error(HTTPStatus.INTERNAL_SERVER_ERROR, str(exc))
+            logger.error("Config write failed key=%s error=%s", key, exc)
+            self.send_error(HTTPStatus.BAD_GATEWAY, str(exc))
 
 
 def growatt_http_handler_factory(
     *,
     inverter: GrowattInverter,
-    timeout: int,
-    x_forwarded_for: bool,
-    auth: GrowattHTTPAuth,
+    http_config: GrowattHTTPConfig,
 ):
     """Factory function to create a GrowattHTTPHandler instance.
 
     Args:
         inverter (GrowattInverter): The Growatt inverter.
-        timeout (int): The timeout in seconds for the request.
-        x_forwarded_for (bool): Whether to use the X-Forwarded-For header.
-        auth (GrowattHTTPAuth): The authentication dataclass."""
+        http_config (GrowattHTTPConfig): HTTP handler configuration."""
     return lambda *args, **kwargs: GrowattHTTPHandler(
-        inverter, timeout, x_forwarded_for, auth, *args, **kwargs
+        inverter,
+        http_config,
+        *args,
+        **kwargs,
+    )
+
+
+@dataclass
+class WebAppConfig:
+    """HTTP server runtime configuration."""
+
+    addr: str
+    port: int
+    request_queue_size: int
+    max_worker_threads: int
+    handler: GrowattHTTPConfig
+
+
+@dataclass
+class GrowattAppConfig:
+    """Application runtime configuration."""
+
+    modbus: ModbusAppConfig
+    web: WebAppConfig
+    log_level: str
+
+
+def configure_logging(log_level: str):
+    """Configure process logging."""
+
+    level_name = log_level.strip().upper()
+    level = getattr(logging, level_name, None)
+    if not isinstance(level, int):
+        raise ValueError(f"Invalid LOG_LEVEL {log_level!r}")
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
+    logger.info("Logging configured level=%s", level_name)
+
+
+def read_app_config(config_path: str = "config.ini") -> GrowattAppConfig:
+    """Read application configuration from an INI file."""
+
+    cfg = configparser.ConfigParser()
+    cfg.read(config_path)
+    logger.debug("Read application config path=%s", config_path)
+    return GrowattAppConfig(
+        modbus=ModbusAppConfig(
+            port=cfg.get("MODBUS", "PORT"),
+            write_queue_size=cfg.getint("MODBUS", "WRITE_QUEUE_SIZE", fallback=128),
+            write_batch_delay_sec=cfg.getfloat(
+                "MODBUS", "WRITE_BATCH_DELAY_SEC", fallback=0.05
+            ),
+            timeout_sec=cfg.getfloat("MODBUS", "TIMEOUT_SEC", fallback=1.5),
+            retries=cfg.getint("MODBUS", "RETRIES", fallback=2),
+            reconnect_delay_sec=cfg.getfloat(
+                "MODBUS", "RECONNECT_DELAY_SEC", fallback=0.2
+            ),
+        ),
+        web=WebAppConfig(
+            addr=cfg.get("WEB", "ADDR", fallback="0.0.0.0"),
+            port=cfg.getint("WEB", "PORT", fallback=8080),
+            request_queue_size=cfg.getint("WEB", "REQUEST_QUEUE_SIZE", fallback=16),
+            max_worker_threads=cfg.getint("WEB", "MAX_WORKER_THREADS", fallback=8),
+            handler=GrowattHTTPConfig(
+                timeout=cfg.getint("WEB", "TIMEOUT_SEC", fallback=10),
+                json_indent=optional_int(cfg.get("WEB", "JSON_INDENT", fallback="")),
+                x_forwarded_for=cfg.getboolean(
+                    "WEB", "X_FORWARDED_FOR", fallback=False
+                ),
+                auth=GrowattHTTPAuth(
+                    username=cfg.get("WEB", "USER"),
+                    password_hash=cfg.get("WEB", "PASS_HASH"),
+                    password_salt=cfg.get("WEB", "PASS_SALT"),
+                ),
+            ),
+        ),
+        log_level=cfg.get("LOGGING", "LEVEL", fallback="INFO"),
     )
 
 
 def main():
     """Main function."""
     inverter: Optional[GrowattInverter] = None
-    http_server: Optional[HTTPServer] = None
+    http_server: Optional[GrowattHTTPServer] = None
     try:
-        cfg = configparser.ConfigParser()
-        cfg.read("config.ini")
-        modbus_port = cfg.get("MODBUS", "PORT")
-        web_user = cfg.get("WEB", "USER")
-        web_pass_salt = cfg.get("WEB", "PASS_SALT")
-        web_pass_hash = cfg.get("WEB", "PASS_HASH")
-        web_addr = cfg.get("WEB", "ADDR")
-        web_port = cfg.getint("WEB", "PORT")
-        web_timeout = cfg.getint("WEB", "TIMEOUT_SEC")
-        web_x_forwarded_for = cfg.getboolean("WEB", "X_FORWARDED_FOR")
+        app_config = read_app_config()
+        configure_logging(app_config.log_level)
 
-        sys.stderr.write(f"[INFO] Inverter port set to {modbus_port}\n")
-        sys.stderr.write(f"[INFO] HTTP Server listening on {web_addr}:{web_port}\n")
-        inverter = GrowattInverter(modbus_port)
+        logger.info("Inverter port set to %s", app_config.modbus.port)
+        logger.info(
+            "HTTP server listening on %s:%s",
+            app_config.web.addr,
+            app_config.web.port,
+        )
+        inverter = GrowattInverter(app_config.modbus)
         http_handler = growatt_http_handler_factory(
             inverter=inverter,
-            timeout=web_timeout,
-            x_forwarded_for=web_x_forwarded_for,
-            auth=GrowattHTTPAuth(
-                username=web_user,
-                password_hash=web_pass_hash,
-                password_salt=web_pass_salt,
-            ),
+            http_config=app_config.web.handler,
         )
-        http_server = HTTPServer((web_addr, web_port), http_handler)
+        http_server = GrowattHTTPServer(
+            (app_config.web.addr, app_config.web.port),
+            http_handler,
+            request_queue_size=app_config.web.request_queue_size,
+            max_worker_threads=app_config.web.max_worker_threads,
+        )
         inverter.connect()
-        http_server.serve_forever()
+        http_server.serve_forever(
+            on_poll=inverter.run_maintenance,
+            get_poll_timeout=inverter.next_maintenance_timeout,
+        )
     except KeyboardInterrupt:
-        pass
+        logger.info("Interrupted; shutting down")
     except Exception as exc:  # pylint: disable=broad-except
-        sys.stderr.write(f"[ERROR] {exc}\n")
+        logger.error("%s", exc)
     finally:
         try:
             if http_server:
                 http_server.server_close()
+                logger.info("HTTP server closed")
         except Exception as exc:  # pylint: disable=broad-except
-            sys.stderr.write(f"[ERROR] Failed to close server: {exc}\n")
+            logger.error("Failed to close server: %s", exc)
 
         try:
             if inverter:
                 inverter.close()
         except Exception as exc:  # pylint: disable=broad-except
-            sys.stderr.write(f"[ERROR] Failed to close inverter: {exc}\n")
+            logger.error("Failed to close inverter: %s", exc)
 
 
 if __name__ == "__main__":

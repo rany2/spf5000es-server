@@ -1,13 +1,26 @@
 [MODBUS]
 PORT = /dev/ttyUSB0
+WRITE_QUEUE_SIZE = 128
+WRITE_BATCH_DELAY_SEC = 0.05
+TIMEOUT_SEC = 1.5
+RETRIES = 2
+RECONNECT_DELAY_SEC = 0.2
+
+[LOGGING]
+; INFO logs startup/shutdown, write summaries, rejections, and recovery events.
+; DEBUG also logs HTTP access, status polling, register windows, and write details.
+LEVEL = INFO
 
 [WEB]
 ADDR = 0.0.0.0
 PORT = 8080
-KEEP_ALIVE = true
 TIMEOUT_SEC = 10
+REQUEST_QUEUE_SIZE = 16
+MAX_WORKER_THREADS = 8
+JSON_INDENT =
 X_FORWARDED_FOR = false
 
+; Generate your PASS_SALT and PASS_HASH using `python3 hash_pass.py`
 USER = admin
-PASS_SALT = ca3d334694c2d59c60caffa9b17d848cd8a0c0fe  ; generate using `python3 hash_pass.py`
-PASS_HASH = 678b7a3f1877deb5b02e2ba6df960b9b053d2eda  ; generate using `python3 hash_pass.py`
+PASS_SALT = ca3d334694c2d59c60caffa9b17d848cd8a0c0fe
+PASS_HASH = 678b7a3f1877deb5b02e2ba6df960b9b053d2eda
