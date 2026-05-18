@@ -4,30 +4,18 @@
 
 # pylint: disable=too-many-lines
 
-import base64
-import binascii
 import configparser
-import hashlib
-import hmac
 import logging
 import math
-import selectors
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
-from functools import wraps
-from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler
 from json import dumps as json_dumps
 from json import loads as json_loads
-from socket import timeout as SocketTimeout
-from socketserver import TCPServer as HTTPServer
-from socketserver import ThreadingMixIn
-from threading import BoundedSemaphore, RLock
+from threading import RLock
 from time import perf_counter, sleep
-from typing import Any, Callable, Dict, List, Optional, Union, override
-from urllib.parse import parse_qs, urlsplit
+from typing import Any, Callable, Dict, List, Optional, Union
 
 import paho.mqtt.client as mqtt
 from pymodbus.client import ModbusSerialClient as ModbusClient
@@ -55,15 +43,6 @@ def str2bool(value: Union[str, bool, int]) -> bool:
 def str2bool2int(value: Union[str, bool, int]) -> int:
     """Converts a string to a boolean value and then to an integer."""
     return int(str2bool(value))
-
-
-def optional_int(value: str) -> Optional[int]:
-    """Parse an optional integer config value."""
-
-    value = value.strip()
-    if value.lower() in ("", "none", "null", "false"):
-        return None
-    return int(value)
 
 
 def optional_str(value: Optional[str]) -> Optional[str]:
@@ -421,149 +400,8 @@ MQTT_ENTITY_METADATA = {
 }
 
 
-def generate_index_html():
-    """Generates the index HTML page."""
-    writable_keys = "".join(
-        f"<li>{key}</li>"
-        for key, item in HOLDING_AND_WRITE_REGISTERS.items()
-        if item[4]
-    )
-    return (
-        "<!DOCTYPE html><html lang='en'><head><title>Growatt</title>"
-        "<style>body{font-family:Arial,Helvetica,sans-serif;}</style>"
-        "<meta name=viewport content='width=device-width,initial-scale=1'>"
-        "</head><body><h1>Growatt</h1><h2>View Data:</h2><ul>"
-        "<li><a href='status' target='_blank'>System Status</a>"
-        "<li><a href='config' target='_blank'>System Configuration</a></ul>"
-        "<h2>Time Sync:</h2><form action='time-sync' method='GET'>"
-        "<input type='submit' value='Sync Time Now'>"
-        "<input type='hidden' name='_method' value='PUT'></form>"
-        "<h2>Modify Configuration:</h2><form action='config' method='GET'>"
-        "<input type='text' name='key' placeholder='Key'>"
-        "<input type='text' name='value' placeholder='Value'>"
-        "<input type='submit' value='Submit'>"
-        "<input type='hidden' name='_method' value='PUT'></form>"
-        "<p>Writeable keys:</p><ul>"
-        f"{writable_keys}</ul></body></html>"
-    ).encode("utf-8")
-
-
-## HTTP Server ##
-INDEX_HTML = generate_index_html()
-CONTENT_TYPE_JSON = "application/json; charset=utf-8"
-CONTENT_TYPE_TEXT = "text/plain; charset=utf-8"
-CONTENT_TYPE_HTML = "text/html; charset=utf-8"
-MAX_AUTH_HEADER_LENGTH = 4096
-MAX_QUERY_FIELDS = 8
-MAX_QUERY_LENGTH = 2048
-
-
 class WriteQueueFullError(RuntimeError):
     """Raised when the pending Modbus write queue is full."""
-
-
-class GrowattHTTPServer(ThreadingMixIn, HTTPServer):
-    """Selector-backed, bounded-thread HTTP server for embedded API service."""
-
-    allow_reuse_address = True
-    request_queue_size = 16
-    daemon_threads = True
-    block_on_close = False
-
-    def __init__(
-        self,
-        *args,
-        request_queue_size: int = 16,
-        max_worker_threads: int = 8,
-        **kwargs,
-    ):
-        self.request_queue_size = max(1, request_queue_size)
-        self.max_worker_threads = max(1, max_worker_threads)
-        self._worker_slots = BoundedSemaphore(self.max_worker_threads)
-        super().__init__(*args, **kwargs)
-        logger.info(
-            "HTTP server initialized bind=%s:%s request_queue_size=%s max_worker_threads=%s",
-            self.server_address[0],
-            self.server_address[1],
-            self.request_queue_size,
-            self.max_worker_threads,
-        )
-
-    @override
-    def process_request(self, request, client_address):
-        """Start a worker for an accepted request, or shed excess clients."""
-
-        if not self._try_acquire_worker_slot():
-            logger.warning(
-                "HTTP worker pool full; closing client=%s max_worker_threads=%s",
-                client_address,
-                self.max_worker_threads,
-            )
-            self.close_request(request)
-            return
-
-        try:
-            super().process_request(request, client_address)
-        except Exception:
-            self._worker_slots.release()
-            raise
-
-    def _try_acquire_worker_slot(self) -> bool:
-        """Reserve capacity for a request without blocking the accept loop."""
-
-        return self._worker_slots.acquire(  # pylint: disable=consider-using-with
-            blocking=False
-        )
-
-    @override
-    def process_request_thread(self, request, client_address):
-        """Release the worker slot after ThreadingMixIn finishes the request."""
-
-        try:
-            super().process_request_thread(request, client_address)
-        finally:
-            self._worker_slots.release()
-
-    def serve_forever(
-        self,
-        poll_interval: float = 0.5,
-        on_poll: Optional[Callable[[], None]] = None,
-        get_poll_timeout: Optional[Callable[[], Optional[float]]] = None,
-    ):
-        """Serve requests from a selector loop and run scheduled callbacks.
-
-        selectors.DefaultSelector maps to epoll on Linux, kqueue on macOS/BSD, and
-        the best available polling primitive elsewhere.
-        """
-
-        shutdown_request_attr = "_BaseServer__shutdown_request"
-        is_shutdown = getattr(self, "_BaseServer__is_shut_down")
-        is_shutdown.clear()
-        logger.info("HTTP server entering serve_forever loop")
-        try:
-            with selectors.DefaultSelector() as selector:
-                selector.register(self, selectors.EVENT_READ)
-                while not getattr(self, shutdown_request_attr):
-                    if on_poll is not None:
-                        on_poll()
-
-                    timeout = max(0.0, poll_interval)
-                    if get_poll_timeout is not None:
-                        next_timeout = get_poll_timeout()
-                        if next_timeout is not None:
-                            timeout = min(timeout, max(0.0, next_timeout))
-
-                    ready = selector.select(timeout)
-                    if getattr(self, shutdown_request_attr):
-                        break
-                    if ready:
-                        logger.debug("HTTP server handling ready request")
-                        self._handle_request_noblock()
-                    self.service_actions()
-        finally:
-            setattr(self, shutdown_request_attr, False)
-            is_shutdown.set()
-            logger.info("HTTP server serve_forever loop stopped")
 
 
 class GrowattModbusClient:  # pylint: disable=too-many-instance-attributes
@@ -1107,7 +945,7 @@ class GrowattInverter:  # pylint: disable=too-many-instance-attributes
                 )
 
     def run_maintenance(self):
-        """Run scheduled inverter work from the HTTP selector loop."""
+        """Run scheduled inverter work."""
 
         with self._lock:
             now = perf_counter()
@@ -1354,528 +1192,9 @@ class GrowattInverter:  # pylint: disable=too-many-instance-attributes
 
 
 @dataclass
-class GrowattHTTPAuth:
-    """Growatt HTTP authentication dataclass."""
-
-    username: str
-    password_hash: str
-    password_salt: str
-
-
-@dataclass
-class GrowattHTTPConfig:
-    """HTTP handler runtime configuration."""
-
-    timeout: int
-    json_indent: Optional[int]
-    x_forwarded_for: bool
-    auth: GrowattHTTPAuth
-
-
-class GrowattHTTPHandler(BaseHTTPRequestHandler):  # pylint: disable=too-many-public-methods
-    """
-    HTTP request handler for the Growatt inverter.
-    """
-
-    protocol_version = "HTTP/1.1"
-    server_version = ""
-    sys_version = ""
-
-    def __init__(
-        self,
-        inverter: GrowattInverter,
-        http_config: GrowattHTTPConfig,
-        *args,
-        **kwargs,
-    ):
-        """Initialize the handler.
-
-        Args:
-            inverter (GrowattInverter): The Growatt inverter.
-            http_config (GrowattHTTPConfig): HTTP handler configuration.
-            *args: Passed to the BaseHTTPRequestHandler constructor.
-            **kwargs: Passed to the BaseHTTPRequestHandler constructor."""
-        self.inverter = inverter
-        self.http_config = http_config
-        self.close_connection = True
-        super().__init__(*args, **kwargs)
-
-    @override
-    def setup(self):
-        """Initialize the request socket and apply the configured timeout."""
-
-        super().setup()
-        self.connection.settimeout(self.http_config.timeout)
-
-    @override
-    def handle(self):
-        """Handle multiple requests while ignoring common client disconnects."""
-        try:
-            super().handle()
-        except (ConnectionResetError, BrokenPipeError, SocketTimeout):
-            logger.debug(
-                "HTTP client disconnected early client=%s",
-                self.client_address,
-            )
-
-    @override
-    def address_string(self) -> str:
-        """Return the client address with X-Forwarded-For support."""
-        if (
-            self.http_config.x_forwarded_for
-            and hasattr(self, "headers")
-            and "X-Forwarded-For" in self.headers
-        ):
-            forwarded_for = self.headers["X-Forwarded-For"].split(",", 1)[0]
-            return self.sanitize_log_value(forwarded_for)
-        return super().address_string()
-
-    @override
-    def version_string(self):
-        """Return the server software version string."""
-        return "Growatt/1.0"
-
-    @override
-    def log_request(self, code: Union[int, str] = "-", size: Union[int, str] = "-"):
-        """Log requests without query strings, which can contain write values."""
-
-        path = self.sanitize_log_value(urlsplit(self.path).path)
-        self.log_message(
-            '"%s %s %s" %s %s',
-            self.command,
-            path,
-            self.request_version,
-            code,
-            size,
-        )
-
-    @override
-    def log_message(self, format: str, *args):  # pylint: disable=redefined-builtin
-        """Route BaseHTTPRequestHandler logs through the module logger."""
-
-        logger.debug(
-            "%s - %s",
-            self.address_string(),
-            self.sanitize_log_value(format % args),
-        )
-
-    @override
-    def log_error(self, format: str, *args):  # pylint: disable=redefined-builtin
-        """Route BaseHTTPRequestHandler errors through the module logger."""
-
-        logger.error(
-            "%s - %s",
-            self.address_string(),
-            self.sanitize_log_value(format % args),
-        )
-
-    @staticmethod
-    def sanitize_log_value(value: str) -> str:
-        """Remove control characters from values written to logs."""
-
-        return "".join(char if char.isprintable() else "?" for char in value).strip()
-
-    @staticmethod
-    def hash_password(password: str, salt: str) -> str:
-        """Hashes the password using the given salt."""
-        return hmac.new(
-            bytes(salt, "utf-8"), bytes(password, "utf-8"), hashlib.sha1
-        ).hexdigest()
-
-    def send_final_response(
-        self, code: int, headers: Dict[str, str], body: Optional[bytes]
-    ):
-        """Set the response code, headers, and body with automatic Content-Length.
-
-        Args:
-            code (int): The HTTP status code.
-            headers (Dict[str, str]): The response headers.
-            body (Optional[bytes]): The response body.
-        """
-        if body is None:
-            body = b""
-
-        explicit_connection = headers.get("Connection", "").lower()
-        if explicit_connection == "close":
-            self.close_connection = True
-        else:
-            self._set_connection_policy()
-        self.send_response(code)
-        if "Cache-Control" not in headers:
-            self.send_header("Cache-Control", "no-store")
-        for key, value in headers.items():
-            self.send_header(key, value)
-        self.send_header("Content-Length", str(len(body)))
-        if "Connection" not in headers:
-            connection = "keep-alive" if self._should_keep_alive() else "close"
-            self.send_header("Connection", connection)
-        self.end_headers()
-        if body and self.command != "HEAD":
-            self.wfile.write(body)
-        logger.debug(
-            "Sent HTTP response method=%s path=%s code=%s bytes=%s close=%s",
-            self.command,
-            self.sanitize_log_value(urlsplit(self.path).path),
-            code,
-            len(body),
-            self.close_connection,
-        )
-
-    def _should_keep_alive(self) -> bool:
-        """Return whether this request may keep the TCP connection open."""
-
-        # A single-threaded HTTP handler must not let an idle keep-alive client
-        # monopolize the event loop after a response.
-        return False
-
-    def _set_connection_policy(self):
-        """Tell BaseHTTPRequestHandler whether another request is expected."""
-
-        self.close_connection = not self._should_keep_alive()
-
-    def send_json_response(self, code: int, data: Any):
-        """Serialize and send a JSON response."""
-
-        body = json_dumps(
-            data,
-            indent=self.http_config.json_indent,
-            separators=None if self.http_config.json_indent is not None else (",", ":"),
-        ).encode("utf-8")
-        self.send_final_response(code, {"Content-Type": CONTENT_TYPE_JSON}, body)
-
-    @override
-    def send_error(
-        self, code: int, message: Optional[str] = None, explain: Optional[str] = None
-    ) -> None:
-        """Send and log an error reply.
-
-        Args:
-            code (int): The HTTP error code.
-            message (str, optional): A simple one-line reason phrase. Defaults to None.
-            explain (str, optional): A detailed message explaining the error. Defaults to None.
-
-        This sends an error response (so it must be called before any
-        output has been generated), logs the error, and finally sends
-        a piece of JSON explaining the error to the user."""
-        try:
-            shortmsg, longmsg = self.responses[code]
-        except KeyError:
-            shortmsg, longmsg = "???", "???"
-        if message is None:
-            message = shortmsg
-        if explain is None:
-            explain = longmsg
-        self.log_error("code %d, message %s", code, message)
-
-        # Message body is omitted for cases described in:
-        #  - RFC7230: 3.3. 1xx, 204(No Content), 304(Not Modified)
-        #  - RFC7231: 6.3.6. 205(Reset Content)
-        if code >= 200 and code not in (
-            HTTPStatus.NO_CONTENT,
-            HTTPStatus.RESET_CONTENT,
-            HTTPStatus.NOT_MODIFIED,
-        ):
-            self.send_json_response(
-                code,
-                {
-                    "code": code,
-                    "message": message,
-                    "explain": explain,
-                },
-            )
-            return
-
-        self.send_final_response(code, {"Content-Type": CONTENT_TYPE_JSON}, None)
-
-    def check_auth(self, username: str, password: str) -> bool:
-        """Validates the password against the stored hash.
-
-        Args:
-            username (str): The username.
-            password (str): The password."""
-        password_hash = GrowattHTTPHandler.hash_password(
-            password,
-            self.http_config.auth.password_salt,
-        )
-        username_matches = hmac.compare_digest(username, self.http_config.auth.username)
-        password_matches = hmac.compare_digest(
-            password_hash,
-            self.http_config.auth.password_hash,
-        )
-        return username_matches and password_matches
-
-    def validate_basic_auth_header(self, authorization_header: str) -> bool:
-        """Validate the Authorization header.
-
-        Args:
-            authorization_header (str): The Authorization header."""
-        try:
-            if len(authorization_header) > MAX_AUTH_HEADER_LENGTH:
-                return False
-            auth_type, auth_string = authorization_header.split(" ", 1)
-            if auth_type.lower() != "basic":
-                return False
-            auth_string = base64.b64decode(auth_string, validate=True).decode("utf-8")
-            if ":" not in auth_string:
-                return False
-            return self.check_auth(*auth_string.split(":", 1))
-        except (binascii.Error, UnicodeDecodeError, ValueError):
-            logger.warning("Rejected malformed Authorization header")
-            return False
-
-    @staticmethod
-    def auth_required(func):
-        """Decorator to require Basic authentication."""
-
-        @wraps(func)
-        def wrapper(self: "GrowattHTTPHandler", *args, **kwargs):
-            """Wrapper function."""
-            if (
-                hasattr(self, "headers")
-                and "Authorization" in self.headers
-                and self.validate_basic_auth_header(self.headers["Authorization"])
-            ):
-                logger.debug(
-                    "HTTP authentication succeeded method=%s path=%s",
-                    getattr(self, "command", "-"),
-                    self.sanitize_log_value(urlsplit(getattr(self, "path", "")).path),
-                )
-                return func(self, *args, **kwargs)
-
-            logger.warning(
-                "HTTP authentication failed method=%s path=%s client=%s",
-                getattr(self, "command", "-"),
-                self.sanitize_log_value(urlsplit(getattr(self, "path", "")).path),
-                getattr(self, "client_address", "-"),
-            )
-            sleep(0.15)
-            self.send_final_response(
-                HTTPStatus.UNAUTHORIZED,
-                {
-                    "Content-Type": CONTENT_TYPE_TEXT,
-                    "WWW-Authenticate": 'Basic realm="Growatt", charset="UTF-8"',
-                    "Connection": "close",
-                },
-                b"Unauthorized",
-            )
-            return None
-
-        return wrapper
-
-    def parse_path_qs(self):
-        """Parse the path and query string.
-
-        Returns:
-            Tuple[str, Dict[str, List[str]]]: The path and query string."""
-        parsed = urlsplit(self.path)
-        if len(parsed.query) > MAX_QUERY_LENGTH:
-            logger.warning("Rejected oversized query path=%s", parsed.path)
-            raise ValueError("Query string too long")
-        logger.debug("Parsed HTTP path path=%s", parsed.path)
-        return parsed.path, parse_qs(
-            parsed.query,
-            keep_blank_values=False,
-            max_num_fields=MAX_QUERY_FIELDS,
-        )
-
-    @auth_required
-    @override
-    def do_HEAD(self):  # pylint: disable=invalid-name
-        """Handle HEAD requests."""
-        self.do_GET()
-
-    def reject_unsupported_method(self):
-        """Reject authenticated but unsupported HTTP methods."""
-
-        self.send_final_response(
-            HTTPStatus.METHOD_NOT_ALLOWED,
-            {
-                "Content-Type": CONTENT_TYPE_TEXT,
-                "Allow": "GET, HEAD, PUT",
-            },
-            b"Method Not Allowed",
-        )
-        logger.warning("Rejected unsupported HTTP method method=%s", self.command)
-
-    @auth_required
-    @override
-    def do_POST(self):  # pylint: disable=invalid-name
-        """Handle unsupported POST requests."""
-        self.reject_unsupported_method()
-
-    @auth_required
-    @override
-    def do_DELETE(self):  # pylint: disable=invalid-name
-        """Handle unsupported DELETE requests."""
-        self.reject_unsupported_method()
-
-    @auth_required
-    @override
-    def do_PATCH(self):  # pylint: disable=invalid-name
-        """Handle unsupported PATCH requests."""
-        self.reject_unsupported_method()
-
-    @auth_required
-    @override
-    def do_OPTIONS(self):  # pylint: disable=invalid-name
-        """Handle unsupported OPTIONS requests."""
-        self.reject_unsupported_method()
-
-    @auth_required
-    @override
-    def do_TRACE(self):  # pylint: disable=invalid-name
-        """Handle unsupported TRACE requests."""
-        self.reject_unsupported_method()
-
-    @auth_required
-    @override
-    def do_GET(self):  # pylint: disable=invalid-name
-        """Handle GET requests."""
-        logger.debug(
-            "Handling HTTP GET path=%s",
-            self.sanitize_log_value(urlsplit(self.path).path),
-        )
-        try:
-            path, qs = self.parse_path_qs()
-        except ValueError as exc:
-            self.send_error(HTTPStatus.URI_TOO_LONG, str(exc))
-            return
-
-        if "_method" in qs:
-            match method := qs["_method"][0].upper():
-                case "PUT":
-                    logger.info("HTTP GET method override to PUT path=%s", path)
-                    self.do_PUT()
-                    return
-                case "GET":
-                    pass  # continue with GET
-                case "HEAD":
-                    self.send_error(
-                        HTTPStatus.BAD_REQUEST,
-                        "HEAD method not supported for _method",
-                    )
-                case _:
-                    self.send_error(
-                        HTTPStatus.NOT_IMPLEMENTED,
-                        f"Unsupported method ({method!r})",
-                    )
-            return
-
-        match path:
-            case "/":
-                self.send_final_response(
-                    HTTPStatus.OK,
-                    {"Content-Type": CONTENT_TYPE_HTML},
-                    INDEX_HTML,
-                )
-            case "/status":
-                try:
-                    self.send_json_response(HTTPStatus.OK, self.inverter.read_status())
-                except ModbusException as exc:
-                    logger.error("Status request failed: %s", exc)
-                    self.send_error(HTTPStatus.BAD_GATEWAY, str(exc))
-            case "/config":
-                try:
-                    self.send_json_response(HTTPStatus.OK, self.inverter.read_config())
-                except ModbusException as exc:
-                    logger.error("Config request failed: %s", exc)
-                    self.send_error(HTTPStatus.BAD_GATEWAY, str(exc))
-            case _:
-                self.send_error(HTTPStatus.NOT_FOUND, "Not Found")
-
-    @auth_required
-    @override
-    def do_PUT(self):  # pylint: disable=invalid-name
-        """Handle PUT requests."""
-        logger.debug(
-            "Handling HTTP PUT path=%s",
-            self.sanitize_log_value(urlsplit(self.path).path),
-        )
-        try:
-            path, qs = self.parse_path_qs()
-        except ValueError as exc:
-            self.send_error(HTTPStatus.URI_TOO_LONG, str(exc))
-            return
-
-        if path == "/time-sync":
-            values = self.inverter.sync_time()
-            if values is None:
-                logger.error("Forced time sync failed")
-                self.send_error(
-                    HTTPStatus.BAD_GATEWAY,
-                    "Failed to update inverter time",
-                )
-                return
-            logger.info("Forced time sync completed values=%s", values)
-            self.send_json_response(
-                HTTPStatus.OK,
-                {
-                    "status": "OK",
-                    "values": values,
-                },
-            )
-            return
-
-        if path != "/config":
-            logger.warning("Rejected config write on invalid path path=%s", path)
-            self.send_error(HTTPStatus.NOT_FOUND, "Not Found")
-            return
-
-        if "key" not in qs or "value" not in qs:
-            logger.warning("Rejected config write with missing query fields")
-            self.send_error(HTTPStatus.BAD_REQUEST, "Invalid query")
-            return
-
-        key = qs["key"][0]
-        try:
-            value = parse_config_value(qs["value"][0])
-        except ValueError:
-            logger.warning("Rejected config write with unparsable value key=%s", key)
-            self.send_error(HTTPStatus.BAD_REQUEST, "Invalid value")
-            return
-
-        try:
-            self.inverter.write_config(key, value)
-            logger.debug("Accepted config write request key=%s", key)
-            self.send_final_response(
-                HTTPStatus.OK,
-                {"Content-Type": CONTENT_TYPE_TEXT},
-                b"OK",
-            )
-        except (KeyError, ValueError) as exc:
-            logger.warning("Rejected config write key=%s error=%s", key, exc)
-            self.send_error(HTTPStatus.BAD_REQUEST, str(exc))
-        except WriteQueueFullError as exc:
-            logger.warning("Config write queue full key=%s", key)
-            self.send_error(HTTPStatus.SERVICE_UNAVAILABLE, str(exc))
-        except ModbusException as exc:
-            logger.error("Config write failed key=%s error=%s", key, exc)
-            self.send_error(HTTPStatus.BAD_GATEWAY, str(exc))
-
-
-def growatt_http_handler_factory(
-    *,
-    inverter: GrowattInverter,
-    http_config: GrowattHTTPConfig,
-):
-    """Factory function to create a GrowattHTTPHandler instance.
-
-    Args:
-        inverter (GrowattInverter): The Growatt inverter.
-        http_config (GrowattHTTPConfig): HTTP handler configuration."""
-    return lambda *args, **kwargs: GrowattHTTPHandler(
-        inverter,
-        http_config,
-        *args,
-        **kwargs,
-    )
-
-
-@dataclass
 class GrowattMqttConfig:  # pylint: disable=too-many-instance-attributes
     """MQTT and Home Assistant discovery runtime configuration."""
 
-    enabled: bool
     host: str
     port: int
     username: Optional[str]
@@ -2119,8 +1438,6 @@ class GrowattMqttService:
     def start(self):
         """Connect to MQTT and start the broker network loop."""
 
-        if not self.config.enabled:
-            return
         logger.info(
             "Connecting MQTT broker host=%s port=%s client_id=%s",
             self.config.host,
@@ -2135,8 +1452,6 @@ class GrowattMqttService:
     def stop(self):
         """Publish offline availability and close the MQTT client."""
 
-        if not self.config.enabled:
-            return
         try:
             self._client.publish(self.availability_topic, "offline", retain=True)
             self._client.loop_stop()
@@ -2325,9 +1640,6 @@ class GrowattMqttService:
     def run_maintenance(self):
         """Publish scheduled status and config states."""
 
-        if not self.config.enabled:
-            return
-
         now = perf_counter()
         if not self._discovery_published:
             return
@@ -2341,7 +1653,7 @@ class GrowattMqttService:
     def next_maintenance_timeout(self) -> Optional[float]:
         """Return seconds until the next MQTT publish is due."""
 
-        if not self.config.enabled or not self._discovery_published:
+        if not self._discovery_published:
             return None
         now = perf_counter()
         deadlines = [
@@ -2387,22 +1699,10 @@ class GrowattMqttService:
 
 
 @dataclass
-class WebAppConfig:
-    """HTTP server runtime configuration."""
-
-    addr: str
-    port: int
-    request_queue_size: int
-    max_worker_threads: int
-    handler: GrowattHTTPConfig
-
-
-@dataclass
 class GrowattAppConfig:
     """Application runtime configuration."""
 
     modbus: ModbusAppConfig
-    web: WebAppConfig
     mqtt: GrowattMqttConfig
     log_level: str
 
@@ -2441,26 +1741,7 @@ def read_app_config(config_path: str = "config.ini") -> GrowattAppConfig:
                 "MODBUS", "RECONNECT_DELAY_SEC", fallback=0.2
             ),
         ),
-        web=WebAppConfig(
-            addr=cfg.get("WEB", "ADDR", fallback="0.0.0.0"),
-            port=cfg.getint("WEB", "PORT", fallback=8080),
-            request_queue_size=cfg.getint("WEB", "REQUEST_QUEUE_SIZE", fallback=16),
-            max_worker_threads=cfg.getint("WEB", "MAX_WORKER_THREADS", fallback=8),
-            handler=GrowattHTTPConfig(
-                timeout=cfg.getint("WEB", "TIMEOUT_SEC", fallback=10),
-                json_indent=optional_int(cfg.get("WEB", "JSON_INDENT", fallback="")),
-                x_forwarded_for=cfg.getboolean(
-                    "WEB", "X_FORWARDED_FOR", fallback=False
-                ),
-                auth=GrowattHTTPAuth(
-                    username=cfg.get("WEB", "USER"),
-                    password_hash=cfg.get("WEB", "PASS_HASH"),
-                    password_salt=cfg.get("WEB", "PASS_SALT"),
-                ),
-            ),
-        ),
         mqtt=GrowattMqttConfig(
-            enabled=cfg.getboolean("MQTT", "ENABLED", fallback=False),
             host=cfg.get("MQTT", "HOST", fallback="localhost"),
             port=cfg.getint("MQTT", "PORT", fallback=1883),
             username=optional_str(cfg.get("MQTT", "USER", fallback=None)),
@@ -2488,7 +1769,6 @@ def read_app_config(config_path: str = "config.ini") -> GrowattAppConfig:
 def main():
     """Main function."""
     inverter: Optional[GrowattInverter] = None
-    http_server: Optional[GrowattHTTPServer] = None
     mqtt_service: Optional[GrowattMqttService] = None
     try:
         app_config = read_app_config()
@@ -2496,30 +1776,14 @@ def main():
 
         logger.info("Inverter port set to %s", app_config.modbus.port)
         logger.info(
-            "HTTP server listening on %s:%s",
-            app_config.web.addr,
-            app_config.web.port,
+            "MQTT broker=%s:%s topic_prefix=%s discovery_prefix=%s",
+            app_config.mqtt.host,
+            app_config.mqtt.port,
+            app_config.mqtt.topic_prefix,
+            app_config.mqtt.discovery_prefix,
         )
-        if app_config.mqtt.enabled:
-            logger.info(
-                "MQTT enabled broker=%s:%s topic_prefix=%s discovery_prefix=%s",
-                app_config.mqtt.host,
-                app_config.mqtt.port,
-                app_config.mqtt.topic_prefix,
-                app_config.mqtt.discovery_prefix,
-            )
         inverter = GrowattInverter(app_config.modbus)
         mqtt_service = GrowattMqttService(inverter, app_config.mqtt)
-        http_handler = growatt_http_handler_factory(
-            inverter=inverter,
-            http_config=app_config.web.handler,
-        )
-        http_server = GrowattHTTPServer(
-            (app_config.web.addr, app_config.web.port),
-            http_handler,
-            request_queue_size=app_config.web.request_queue_size,
-            max_worker_threads=app_config.web.max_worker_threads,
-        )
         inverter.connect()
         mqtt_service.start()
 
@@ -2539,10 +1803,11 @@ def main():
             ]
             return min(timeouts) if timeouts else None
 
-        http_server.serve_forever(
-            on_poll=run_maintenance,
-            get_poll_timeout=next_maintenance_timeout,
-        )
+        logger.info("MQTT service loop started")
+        while True:
+            run_maintenance()
+            timeout = next_maintenance_timeout()
+            sleep(min(0.5, timeout) if timeout is not None else 0.5)
     except KeyboardInterrupt:
         logger.info("Interrupted; shutting down")
     except Exception as exc:  # pylint: disable=broad-except
@@ -2553,13 +1818,6 @@ def main():
                 mqtt_service.stop()
         except Exception as exc:  # pylint: disable=broad-except
             logger.error("Failed to close MQTT client: %s", exc)
-
-        try:
-            if http_server:
-                http_server.server_close()
-                logger.info("HTTP server closed")
-        except Exception as exc:  # pylint: disable=broad-except
-            logger.error("Failed to close server: %s", exc)
 
         try:
             if inverter:

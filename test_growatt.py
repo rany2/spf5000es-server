@@ -2,14 +2,9 @@
 
 """Tests for Modbus validation and recovery behavior."""
 
-import base64
 import json
 from datetime import datetime
-from http.client import HTTPConnection
-from http import HTTPStatus
-import socket
 import tempfile
-import threading
 import textwrap
 import unittest
 from unittest.mock import Mock, patch
@@ -19,18 +14,12 @@ from pymodbus.exceptions import ModbusException
 from growatt import (
     HOLDING_REGISTER_WINDOWS,
     INPUT_REGISTER_WINDOWS,
-    MAX_AUTH_HEADER_LENGTH,
-    GrowattHTTPAuth,
-    GrowattHTTPConfig,
-    GrowattHTTPHandler,
-    GrowattHTTPServer,
     GrowattInverter,
     GrowattMqttConfig,
     GrowattMqttService,
     GrowattModbusClient,
     ModbusAppConfig,
     WriteQueueFullError,
-    growatt_http_handler_factory,
     read_app_config,
 )
 
@@ -141,20 +130,6 @@ class FakeGrowattClient:  # pylint: disable=too-few-public-methods
         self.ready_waits += 1
 
 
-class FakeTimeSyncInverter:  # pylint: disable=too-few-public-methods
-    """Small fake for exercising the HTTP forced time sync route."""
-
-    def __init__(self, values):
-        self.values = values
-        self.called = False
-
-    def force_time_sync_now(self):
-        """Record and return a forced sync result."""
-
-        self.called = True
-        return self.values
-
-
 class FakeMqttClient:
     """Small fake for exercising MQTT discovery without a broker."""
 
@@ -214,20 +189,10 @@ class FakeMqttMessage:  # pylint: disable=too-few-public-methods
         self.payload = payload.encode("utf-8")
 
 
-def build_basic_auth(username="admin", password="admin"):
-    """Return a Basic authorization header value for tests."""
-
-    credentials = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode(
-        "ascii"
-    )
-    return f"Basic {credentials}"
-
-
 def make_mqtt_config(**overrides):
     """Build a complete MQTT config for service tests."""
 
     config = {
-        "enabled": True,
         "host": "mqtt.local",
         "port": 1883,
         "username": None,
@@ -314,11 +279,6 @@ class GrowattRecoveryTest(unittest.TestCase):
                     """
                     [MODBUS]
                     PORT = /dev/ttyUSB0
-
-                    [WEB]
-                    USER = admin
-                    PASS_SALT = salt
-                    PASS_HASH = hash
                     """
                 )
             )
@@ -326,14 +286,8 @@ class GrowattRecoveryTest(unittest.TestCase):
 
             config = read_app_config(config_file.name)
 
-        self.assertEqual(config.web.addr, "0.0.0.0")
-        self.assertEqual(config.web.port, 8080)
-        self.assertEqual(config.web.handler.timeout, 10)
-        self.assertEqual(config.web.max_worker_threads, 8)
-        self.assertFalse(config.web.handler.x_forwarded_for)
         self.assertEqual(config.modbus.timeout_sec, 1.5)
         self.assertEqual(config.modbus.retries, 2)
-        self.assertFalse(config.mqtt.enabled)
         self.assertEqual(config.mqtt.topic_prefix, "growatt_spf5000es")
         self.assertIsNone(config.mqtt.username)
 
@@ -401,70 +355,8 @@ class GrowattRecoveryTest(unittest.TestCase):
 
         inverter.write_config.assert_called_once_with("OutputConfig", "SBU")
 
-    def test_http_server_serves_second_client_while_first_is_idle(self):
-        """An idle TCP client should not monopolize the HTTP accept loop."""
-
-        http_config = GrowattHTTPConfig(
-            timeout=2,
-            json_indent=None,
-            x_forwarded_for=False,
-            auth=GrowattHTTPAuth(
-                username="admin",
-                password_hash=GrowattHTTPHandler.hash_password("admin", "salt"),
-                password_salt="salt",
-            ),
-        )
-        server = GrowattHTTPServer(
-            ("127.0.0.1", 0),
-            growatt_http_handler_factory(
-                inverter=Mock(),
-                http_config=http_config,
-            ),
-            max_worker_threads=2,
-        )
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        idle_client = socket.create_connection(server.server_address, timeout=1)
-
-        try:
-            conn = HTTPConnection(*server.server_address, timeout=1)
-            conn.request(
-                "GET",
-                "/",
-                headers={"Authorization": build_basic_auth()},
-            )
-            response = conn.getresponse()
-            body = response.read()
-            conn.close()
-
-            self.assertEqual(response.status, HTTPStatus.OK)
-            self.assertIn(b"<h1>Growatt</h1>", body)
-        finally:
-            idle_client.close()
-            server.shutdown()
-            server.server_close()
-            thread.join(timeout=2)
-
-    def test_password_hash_uses_sha1_hmac(self):
-        """Password hashing should use the configured SHA1-HMAC format."""
-
-        self.assertEqual(
-            GrowattHTTPHandler.hash_password("admin", "salt"),
-            "ed5768641a6bdcae1fd5a2b641465e28e5fcea09",
-        )
-
-    def test_rejects_oversized_basic_auth_header(self):
-        """Oversized Authorization headers should fail before base64 decoding."""
-
-        self.assertFalse(
-            GrowattHTTPHandler.validate_basic_auth_header(
-                object.__new__(GrowattHTTPHandler),
-                "Basic " + ("A" * MAX_AUTH_HEADER_LENGTH),
-            )
-        )
-
     def test_run_maintenance_flushes_queued_writes(self):
-        """Queued writes should flush from the selector-loop maintenance hook."""
+        """Queued writes should flush from the maintenance hook."""
 
         inverter = GrowattInverter(make_modbus_config(write_batch_delay_sec=60))
         fake = FakeGrowattClient()

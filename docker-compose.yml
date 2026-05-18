@@ -3,8 +3,6 @@ services:
         image: ghcr.io/rany2/spf5000es-server:master
         container_name: spf5000es-server
         restart: unless-stopped
-        ports:
-            - "8080:8080"
         volumes:
             - ./config.ini:/app/config.ini:ro
         security_opt:
