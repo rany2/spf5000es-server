@@ -20,6 +20,7 @@ from functools import wraps
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler
 from json import dumps as json_dumps
+from json import loads as json_loads
 from socket import timeout as SocketTimeout
 from socketserver import TCPServer as HTTPServer
 from socketserver import ThreadingMixIn
@@ -28,6 +29,7 @@ from time import perf_counter, sleep
 from typing import Any, Callable, Dict, List, Optional, Union, override
 from urllib.parse import parse_qs, urlsplit
 
+import paho.mqtt.client as mqtt
 from pymodbus.client import ModbusSerialClient as ModbusClient
 from pymodbus.exceptions import ModbusException
 
@@ -62,6 +64,17 @@ def optional_int(value: str) -> Optional[int]:
     if value.lower() in ("", "none", "null", "false"):
         return None
     return int(value)
+
+
+def optional_str(value: Optional[str]) -> Optional[str]:
+    """Parse an optional string config value."""
+
+    if value is None:
+        return None
+    value = value.strip()
+    if value.lower() in ("", "none", "null", "false"):
+        return None
+    return value
 
 
 def parse_config_value(value: str) -> Union[str, int, float]:
@@ -335,6 +348,76 @@ HOLDING_AND_WRITE_REGISTERS = {
     "ParaMaxChgAmps": (105, 1, RegType.UINT, int, None),
     "LiProtocolType": (106, 1, RegType.UINT, int, int),
     "AudioAlarmEnable": (107, 1, RegType.UINT, bool, str2bool2int),
+}
+
+CONFIG_SELECT_OPTIONS = {
+    "OutputConfig": list(OUTPUT_CONFIG_W),
+    "ChargeConfig": list(CHARGE_CONFIG_W),
+    "PVModel": list(PV_MODEL_W),
+    "ACInModel": list(AC_IN_MODEL_W),
+    "OutputVoltType": list(OUTPUT_VOLT_TYPE_W),
+    "OutputFreqType": list(OUTPUT_FREQ_TYPE_W),
+    "OverLoadRestart": list(OVER_LOAD_RESTART_W),
+    "BatteryType": list(BATTERY_TYPE_W),
+    "AgingMode": list(AGING_MODE_W),
+    "SafetyType": list(SAFETY_TYPE_W),
+}
+
+CONFIG_BOOLEAN_KEYS = {
+    "OverTempRestart",
+    "BuzzerEnable",
+    "BypEnable",
+    "PowSavingEnable",
+    "SpowBalEnable",
+    "ClrEnergyToday",
+    "ClrEnergyAll",
+    "BurnInTestEnable",
+    "ManualStartEnable",
+    "SciLossChkEnable",
+    "BlightEnable",
+    "AudioAlarmEnable",
+}
+
+MQTT_ENTITY_METADATA = {
+    "SystemStatus": {"icon": "mdi:solar-power"},
+    "FaultBit": {"icon": "mdi:alert-circle-outline"},
+    "WarningBit": {"icon": "mdi:alert-outline"},
+    "WarningBitHigh": {"icon": "mdi:alert-outline"},
+    "WarningValue": {"icon": "mdi:alert-outline"},
+    "DeviceTypeCode": {"icon": "mdi:identifier"},
+    "WorkTimeTotalSeconds": {"icon": "mdi:timer-outline"},
+    "OutputConfig": {"icon": "mdi:transmission-tower-export"},
+    "ChargeConfig": {"icon": "mdi:battery-charging"},
+    "UtiOutStart": {"icon": "mdi:clock-start", "unit_of_measurement": "h"},
+    "UtiOutEnd": {"icon": "mdi:clock-end", "unit_of_measurement": "h"},
+    "UtiChargeStart": {"icon": "mdi:battery-clock", "unit_of_measurement": "h"},
+    "UtiChargeEnd": {"icon": "mdi:battery-clock", "unit_of_measurement": "h"},
+    "PVModel": {"icon": "mdi:solar-panel"},
+    "ACInModel": {"icon": "mdi:transmission-tower-import"},
+    "FWVersion": {"icon": "mdi:chip"},
+    "FWVersion2": {"icon": "mdi:chip"},
+    "LCDLanguage": {"icon": "mdi:translate"},
+    "SerialNumber": {"icon": "mdi:barcode"},
+    "MoudleH": {"icon": "mdi:chip"},
+    "MoudleL": {"icon": "mdi:chip"},
+    "ComAddress": {"icon": "mdi:serial-port"},
+    "FlashStart": {"icon": "mdi:flash"},
+    "ResetUserInfo": {"icon": "mdi:account-sync-outline"},
+    "ResetToFactory": {"icon": "mdi:factory"},
+    "BatteryType": {"icon": "mdi:car-battery"},
+    "AgingMode": {"icon": "mdi:timer-sand"},
+    "FunctionMask": {"icon": "mdi:bitwise"},
+    "SafetyType": {"icon": "mdi:shield-check-outline"},
+    "DTC": {"icon": "mdi:alert-decagram-outline"},
+    "SysYear": {"icon": "mdi:calendar"},
+    "SysMonth": {"icon": "mdi:calendar-month"},
+    "SysDay": {"icon": "mdi:calendar-today"},
+    "SysHour": {"icon": "mdi:clock-outline", "unit_of_measurement": "h"},
+    "SysMin": {"icon": "mdi:clock-outline", "unit_of_measurement": "min"},
+    "SysSec": {"icon": "mdi:clock-outline", "unit_of_measurement": "s"},
+    "ComboardVer": {"icon": "mdi:chip"},
+    "uwBatPieceNum": {"icon": "mdi:battery-multiple"},
+    "LiProtocolType": {"icon": "mdi:protocol"},
 }
 
 
@@ -1789,6 +1872,521 @@ def growatt_http_handler_factory(
 
 
 @dataclass
+class GrowattMqttConfig:  # pylint: disable=too-many-instance-attributes
+    """MQTT and Home Assistant discovery runtime configuration."""
+
+    enabled: bool
+    host: str
+    port: int
+    username: Optional[str]
+    password: Optional[str]
+    client_id: str
+    keepalive: int
+    topic_prefix: str
+    discovery_prefix: str
+    device_id: str
+    device_name: str
+    retain: bool
+    status_interval_sec: float
+    config_interval_sec: float
+
+    def __post_init__(self):
+        """Normalize timing and topic config."""
+
+        self.keepalive = max(1, self.keepalive)
+        self.status_interval_sec = max(1.0, self.status_interval_sec)
+        self.config_interval_sec = max(1.0, self.config_interval_sec)
+        self.topic_prefix = self.topic_prefix.strip("/") or self.device_id
+        self.discovery_prefix = self.discovery_prefix.strip("/") or "homeassistant"
+
+
+class GrowattMqttService:
+    """Publish inverter state and accept config writes over MQTT."""
+
+    def __init__(self, inverter: GrowattInverter, config: GrowattMqttConfig):
+        self.inverter = inverter
+        self.config = config
+        self._client = self._make_client()
+        self._next_status_publish: Optional[float] = None
+        self._next_config_publish: Optional[float] = None
+        self._discovery_published = False
+
+    @property
+    def base_topic(self) -> str:
+        """Return the normalized base topic."""
+
+        return self.config.topic_prefix.strip("/")
+
+    @property
+    def availability_topic(self) -> str:
+        """Return the MQTT availability topic."""
+
+        return f"{self.base_topic}/availability"
+
+    @staticmethod
+    def _slug(value: str) -> str:
+        """Create a Home Assistant-safe object id fragment."""
+
+        output = []
+        previous_separator = False
+        for index, char in enumerate(value):
+            previous = value[index - 1] if index else ""
+            next_char = value[index + 1] if index + 1 < len(value) else ""
+            if (
+                index
+                and char.isupper()
+                and (
+                    previous.islower()
+                    or previous.isdigit()
+                    or (previous.isupper() and next_char.islower())
+                )
+                and not previous_separator
+            ):
+                output.append("_")
+            if char.isalnum():
+                output.append(char.lower())
+                previous_separator = False
+            elif not previous_separator:
+                output.append("_")
+                previous_separator = True
+        return "".join(output).strip("_")
+
+    @staticmethod
+    def _friendly_name(value: str) -> str:
+        """Split a register key into a compact display name."""
+
+        words = []
+        current = ""
+        for index, char in enumerate(value):
+            previous = value[index - 1] if index else ""
+            next_char = value[index + 1] if index + 1 < len(value) else ""
+            boundary = (
+                current
+                and char.isupper()
+                and (
+                    previous.islower()
+                    or previous.isdigit()
+                    or (previous.isupper() and next_char.islower())
+                )
+            )
+            if boundary:
+                words.append(current)
+                current = char
+            else:
+                current += char
+        if current:
+            words.append(current)
+        return " ".join(words)
+
+    @classmethod
+    def _value_topic(cls, base_topic: str, namespace: str, key: str) -> str:
+        """Return a state topic for a register value."""
+
+        return f"{base_topic}/{namespace}/{cls._slug(key)}/state"
+
+    @staticmethod
+    def _mqtt_value(value: Any) -> str:
+        """Serialize a scalar value for MQTT state and command topics."""
+
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        return str(value)
+
+    @staticmethod
+    def _sensor_metadata(key: str) -> Dict[str, str]:
+        """Infer Home Assistant sensor metadata from the register name."""
+
+        metadata: Dict[str, str] = dict(MQTT_ENTITY_METADATA.get(key, {}))
+        lower_key = key.lower()
+        if "temp" in lower_key and lower_key.endswith("c"):
+            metadata.update(
+                {
+                    "device_class": "temperature",
+                    "icon": "mdi:thermometer",
+                    "unit_of_measurement": "°C",
+                }
+            )
+        elif "volt" in lower_key:
+            metadata.update(
+                {
+                    "device_class": "voltage",
+                    "icon": "mdi:sine-wave",
+                    "unit_of_measurement": "V",
+                }
+            )
+        elif "watt" in lower_key:
+            metadata.update(
+                {
+                    "device_class": "power",
+                    "icon": "mdi:flash",
+                    "unit_of_measurement": "W",
+                }
+            )
+        elif lower_key.endswith("va"):
+            metadata.update(
+                {
+                    "device_class": "apparent_power",
+                    "icon": "mdi:flash-triangle-outline",
+                    "unit_of_measurement": "VA",
+                }
+            )
+        elif "amps" in lower_key:
+            metadata.update(
+                {
+                    "device_class": "current",
+                    "icon": "mdi:current-ac",
+                    "unit_of_measurement": "A",
+                }
+            )
+        elif "freq" in lower_key:
+            metadata.update(
+                {
+                    "device_class": "frequency",
+                    "icon": "mdi:sine-wave",
+                    "unit_of_measurement": "Hz",
+                }
+            )
+        elif "percent" in lower_key or lower_key.endswith("soc"):
+            metadata.update(
+                {
+                    "icon": "mdi:percent-outline",
+                    "unit_of_measurement": "%",
+                }
+            )
+        elif lower_key.endswith("kwh"):
+            metadata.update(
+                {
+                    "device_class": "energy",
+                    "icon": "mdi:lightning-bolt",
+                    "unit_of_measurement": "kWh",
+                    "state_class": "total_increasing"
+                    if "total" in lower_key
+                    else "measurement",
+                }
+            )
+        elif "seconds" in lower_key:
+            metadata.update(
+                {
+                    "device_class": "duration",
+                    "icon": "mdi:timer-outline",
+                    "unit_of_measurement": "s",
+                }
+            )
+        elif "fan" in lower_key:
+            metadata.setdefault("icon", "mdi:fan")
+        elif "battery" in lower_key or lower_key.startswith("bat"):
+            metadata.setdefault("icon", "mdi:battery")
+        elif "pv" in lower_key:
+            metadata.setdefault("icon", "mdi:solar-panel")
+        elif "grid" in lower_key or "uti" in lower_key:
+            metadata.setdefault("icon", "mdi:transmission-tower")
+        elif "output" in lower_key:
+            metadata.setdefault("icon", "mdi:power-plug-outline")
+        elif "buzzer" in lower_key or "alarm" in lower_key:
+            metadata.setdefault("icon", "mdi:bell-ring-outline")
+        elif "restart" in lower_key or "reset" in lower_key:
+            metadata.setdefault("icon", "mdi:restart")
+        elif "enable" in lower_key:
+            metadata.setdefault("icon", "mdi:toggle-switch-outline")
+
+        if (
+            "unit_of_measurement" in metadata
+            and "state_class" not in metadata
+            and metadata.get("device_class") != "duration"
+        ):
+            metadata["state_class"] = "measurement"
+        return metadata
+
+    def _make_client(self):
+        """Create a paho client compatible with paho-mqtt 1.x and 2.x."""
+
+        try:
+            client = mqtt.Client(
+                mqtt.CallbackAPIVersion.VERSION2,
+                client_id=self.config.client_id,
+            )
+        except AttributeError:
+            client = mqtt.Client(client_id=self.config.client_id)
+
+        if self.config.username is not None:
+            client.username_pw_set(self.config.username, self.config.password)
+        client.will_set(self.availability_topic, "offline", retain=True)
+        client.on_connect = self._on_connect
+        client.on_disconnect = self._on_disconnect
+        client.on_message = self._on_message
+        return client
+
+    def start(self):
+        """Connect to MQTT and start the broker network loop."""
+
+        if not self.config.enabled:
+            return
+        logger.info(
+            "Connecting MQTT broker host=%s port=%s client_id=%s",
+            self.config.host,
+            self.config.port,
+            self.config.client_id,
+        )
+        self._client.connect(self.config.host, self.config.port, self.config.keepalive)
+        self._client.loop_start()
+        self._next_status_publish = perf_counter()
+        self._next_config_publish = perf_counter()
+
+    def stop(self):
+        """Publish offline availability and close the MQTT client."""
+
+        if not self.config.enabled:
+            return
+        try:
+            self._client.publish(self.availability_topic, "offline", retain=True)
+            self._client.loop_stop()
+            self._client.disconnect()
+            logger.info("MQTT client stopped")
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.error("Failed to stop MQTT client: %s", exc)
+
+    def _on_connect(self, client, _userdata, _flags, reason_code, _properties=None):
+        """Handle MQTT connection and subscribe to command topics."""
+
+        try:
+            connected = int(reason_code) == 0
+        except TypeError:
+            connected = str(reason_code).lower() == "success"
+        if not connected:
+            logger.error("MQTT connection failed reason=%s", reason_code)
+            return
+        logger.info("MQTT connected")
+        client.publish(self.availability_topic, "online", retain=True)
+        client.subscribe(f"{self.base_topic}/config/+/set")
+        client.subscribe(f"{self.base_topic}/time_sync/set")
+        self._publish_discovery()
+        self._discovery_published = True
+        self._next_status_publish = perf_counter()
+        self._next_config_publish = perf_counter()
+
+    def _on_disconnect(
+        self,
+        _client,
+        _userdata,
+        _disconnect_flags=None,
+        reason_code=None,
+        _properties=None,
+    ):
+        """Log MQTT disconnections."""
+
+        logger.warning("MQTT disconnected reason=%s", reason_code)
+
+    def _on_message(self, _client, _userdata, message):
+        """Handle Home Assistant command topics."""
+
+        topic = message.topic
+        payload = message.payload.decode("utf-8", errors="replace").strip()
+        logger.debug("MQTT command received topic=%s", topic)
+        if topic == f"{self.base_topic}/time_sync/set":
+            self.inverter.sync_time()
+            self._next_config_publish = perf_counter()
+            return
+
+        prefix = f"{self.base_topic}/config/"
+        suffix = "/set"
+        if not topic.startswith(prefix) or not topic.endswith(suffix):
+            return
+        key_slug = topic[len(prefix) : -len(suffix)]
+        key = next(
+            (name for name in HOLDING_AND_WRITE_REGISTERS if self._slug(name) == key_slug),
+            None,
+        )
+        if key is None:
+            logger.warning("Ignoring MQTT command for unknown config key topic=%s", topic)
+            return
+
+        try:
+            value = self._parse_command_payload(payload)
+            self.inverter.write_config(key, value)
+            write_delay_sec = getattr(self.inverter, "write_batch_delay_sec", 0.0)
+            if not isinstance(write_delay_sec, (int, float)):
+                write_delay_sec = 0.0
+            self._next_config_publish = perf_counter() + max(
+                1.0,
+                write_delay_sec + GrowattInverter.CONFIG_WRITE_SETTLE_DELAY_SEC,
+            )
+            logger.info("Accepted MQTT config command key=%s", key)
+        except (KeyError, ValueError, WriteQueueFullError, ModbusException) as exc:
+            logger.warning("Rejected MQTT config command key=%s error=%s", key, exc)
+
+    @staticmethod
+    def _parse_command_payload(payload: str) -> Union[str, int, float, bool]:
+        """Parse a command payload from HA text, switch, select, or number entities."""
+
+        if payload.lower() in ("true", "false", "on", "off"):
+            return payload.lower() in ("true", "on")
+        try:
+            decoded = json_loads(payload)
+            if isinstance(decoded, (str, int, float, bool)):
+                return decoded
+        except ValueError:
+            pass
+        return parse_config_value(payload)
+
+    def _device_payload(self) -> Dict[str, Any]:
+        """Return the shared Home Assistant device block."""
+
+        return {
+            "identifiers": [self.config.device_id],
+            "name": self.config.device_name,
+            "manufacturer": "Growatt",
+            "model": "SPF 5000 ES",
+        }
+
+    def _entity_base_payload(self, object_id: str, name: str) -> Dict[str, Any]:
+        """Return fields common to all MQTT discovery entities."""
+
+        return {
+            "name": name,
+            "object_id": object_id,
+            "unique_id": f"{self.config.device_id}_{object_id}",
+            "availability_topic": self.availability_topic,
+            "device": self._device_payload(),
+        }
+
+    def _publish_discovery(self):
+        """Publish retained Home Assistant discovery configuration."""
+
+        logger.info("Publishing Home Assistant MQTT discovery")
+        for key in INPUT_REGISTERS:
+            object_id = f"{self.config.device_id}_{self._slug(key)}"
+            payload = self._entity_base_payload(object_id, self._friendly_name(key))
+            payload.update(
+                {
+                    "state_topic": self._value_topic(self.base_topic, "status", key),
+                }
+            )
+            payload.update(self._sensor_metadata(key))
+            self._publish_discovery_payload("sensor", object_id, payload)
+
+        for key, item in HOLDING_AND_WRITE_REGISTERS.items():
+            component, payload = self._config_entity_discovery_payload(key, item)
+            object_id = payload["object_id"]
+            self._publish_discovery_payload(component, object_id, payload)
+
+        object_id = f"{self.config.device_id}_sync_time"
+        payload = self._entity_base_payload(object_id, "Sync Time")
+        payload["command_topic"] = f"{self.base_topic}/time_sync/set"
+        payload["payload_press"] = "sync"
+        payload["icon"] = "mdi:clock-sync-outline"
+        self._publish_discovery_payload("button", object_id, payload)
+
+    def _config_entity_discovery_payload(
+        self, key: str, item: tuple
+    ) -> tuple[str, Dict[str, Any]]:
+        """Build discovery payload for a config register."""
+
+        _, _, type_, _, writepreprocess = item
+        writable = writepreprocess is not None
+        object_id = f"{self.config.device_id}_{self._slug(key)}"
+        payload = self._entity_base_payload(object_id, self._friendly_name(key))
+        payload["state_topic"] = self._value_topic(self.base_topic, "config", key)
+        payload.update(self._sensor_metadata(key))
+
+        if not writable:
+            return "sensor", payload
+
+        payload["command_topic"] = f"{self.base_topic}/config/{self._slug(key)}/set"
+        if key in CONFIG_SELECT_OPTIONS:
+            payload["options"] = CONFIG_SELECT_OPTIONS[key]
+            return "select", payload
+        if key in CONFIG_BOOLEAN_KEYS:
+            payload.update(
+                {
+                    "payload_on": "true",
+                    "payload_off": "false",
+                    "state_on": "true",
+                    "state_off": "false",
+                }
+            )
+            return "switch", payload
+        if type_ == RegType.CHAR:
+            return "text", payload
+
+        payload["mode"] = "box"
+        return "number", payload
+
+    def _publish_discovery_payload(
+        self, component: str, object_id: str, payload: Dict[str, Any]
+    ):
+        """Publish one Home Assistant MQTT discovery config payload."""
+
+        topic = (
+            f"{self.config.discovery_prefix.strip('/')}/{component}/"
+            f"{self.config.device_id}/{object_id}/config"
+        )
+        self._client.publish(topic, json_dumps(payload), retain=True)
+
+    def run_maintenance(self):
+        """Publish scheduled status and config states."""
+
+        if not self.config.enabled:
+            return
+
+        now = perf_counter()
+        if not self._discovery_published:
+            return
+        if self._next_status_publish is not None and now >= self._next_status_publish:
+            self.publish_status()
+            self._next_status_publish = now + self.config.status_interval_sec
+        if self._next_config_publish is not None and now >= self._next_config_publish:
+            self.publish_config()
+            self._next_config_publish = now + self.config.config_interval_sec
+
+    def next_maintenance_timeout(self) -> Optional[float]:
+        """Return seconds until the next MQTT publish is due."""
+
+        if not self.config.enabled or not self._discovery_published:
+            return None
+        now = perf_counter()
+        deadlines = [
+            deadline - now
+            for deadline in (self._next_status_publish, self._next_config_publish)
+            if deadline is not None
+        ]
+        if not deadlines:
+            return None
+        return max(0.0, min(deadlines))
+
+    def publish_status(self):
+        """Read and publish status registers."""
+
+        try:
+            status = self.inverter.read_status()
+        except ModbusException as exc:
+            logger.error("MQTT status publish failed: %s", exc)
+            return
+        for key, value in status.items():
+            self._client.publish(
+                self._value_topic(self.base_topic, "status", key),
+                self._mqtt_value(value),
+                retain=self.config.retain,
+            )
+        logger.debug("MQTT status published fields=%s", len(status))
+
+    def publish_config(self):
+        """Read and publish config registers."""
+
+        try:
+            config = self.inverter.read_config()
+        except ModbusException as exc:
+            logger.error("MQTT config publish failed: %s", exc)
+            return
+        for key, value in config.items():
+            self._client.publish(
+                self._value_topic(self.base_topic, "config", key),
+                self._mqtt_value(value),
+                retain=self.config.retain,
+            )
+        logger.debug("MQTT config published fields=%s", len(config))
+
+
+@dataclass
 class WebAppConfig:
     """HTTP server runtime configuration."""
 
@@ -1805,6 +2403,7 @@ class GrowattAppConfig:
 
     modbus: ModbusAppConfig
     web: WebAppConfig
+    mqtt: GrowattMqttConfig
     log_level: str
 
 
@@ -1828,6 +2427,7 @@ def read_app_config(config_path: str = "config.ini") -> GrowattAppConfig:
     cfg = configparser.ConfigParser()
     cfg.read(config_path)
     logger.debug("Read application config path=%s", config_path)
+    mqtt_device_id = cfg.get("MQTT", "DEVICE_ID", fallback="growatt_spf5000es")
     return GrowattAppConfig(
         modbus=ModbusAppConfig(
             port=cfg.get("MODBUS", "PORT"),
@@ -1859,6 +2459,28 @@ def read_app_config(config_path: str = "config.ini") -> GrowattAppConfig:
                 ),
             ),
         ),
+        mqtt=GrowattMqttConfig(
+            enabled=cfg.getboolean("MQTT", "ENABLED", fallback=False),
+            host=cfg.get("MQTT", "HOST", fallback="localhost"),
+            port=cfg.getint("MQTT", "PORT", fallback=1883),
+            username=optional_str(cfg.get("MQTT", "USER", fallback=None)),
+            password=optional_str(cfg.get("MQTT", "PASSWORD", fallback=None)),
+            client_id=cfg.get("MQTT", "CLIENT_ID", fallback=mqtt_device_id),
+            keepalive=cfg.getint("MQTT", "KEEPALIVE_SEC", fallback=60),
+            topic_prefix=cfg.get("MQTT", "TOPIC_PREFIX", fallback=mqtt_device_id),
+            discovery_prefix=cfg.get(
+                "MQTT", "DISCOVERY_PREFIX", fallback="homeassistant"
+            ),
+            device_id=mqtt_device_id,
+            device_name=cfg.get("MQTT", "DEVICE_NAME", fallback="Growatt SPF 5000 ES"),
+            retain=cfg.getboolean("MQTT", "RETAIN", fallback=True),
+            status_interval_sec=cfg.getfloat(
+                "MQTT", "STATUS_INTERVAL_SEC", fallback=10.0
+            ),
+            config_interval_sec=cfg.getfloat(
+                "MQTT", "CONFIG_INTERVAL_SEC", fallback=300.0
+            ),
+        ),
         log_level=cfg.get("LOGGING", "LEVEL", fallback="INFO"),
     )
 
@@ -1867,6 +2489,7 @@ def main():
     """Main function."""
     inverter: Optional[GrowattInverter] = None
     http_server: Optional[GrowattHTTPServer] = None
+    mqtt_service: Optional[GrowattMqttService] = None
     try:
         app_config = read_app_config()
         configure_logging(app_config.log_level)
@@ -1877,7 +2500,16 @@ def main():
             app_config.web.addr,
             app_config.web.port,
         )
+        if app_config.mqtt.enabled:
+            logger.info(
+                "MQTT enabled broker=%s:%s topic_prefix=%s discovery_prefix=%s",
+                app_config.mqtt.host,
+                app_config.mqtt.port,
+                app_config.mqtt.topic_prefix,
+                app_config.mqtt.discovery_prefix,
+            )
         inverter = GrowattInverter(app_config.modbus)
+        mqtt_service = GrowattMqttService(inverter, app_config.mqtt)
         http_handler = growatt_http_handler_factory(
             inverter=inverter,
             http_config=app_config.web.handler,
@@ -1889,15 +2521,39 @@ def main():
             max_worker_threads=app_config.web.max_worker_threads,
         )
         inverter.connect()
+        mqtt_service.start()
+
+        def run_maintenance():
+            inverter.run_maintenance()
+            if mqtt_service:
+                mqtt_service.run_maintenance()
+
+        def next_maintenance_timeout():
+            timeouts = [
+                timeout
+                for timeout in (
+                    inverter.next_maintenance_timeout(),
+                    mqtt_service.next_maintenance_timeout() if mqtt_service else None,
+                )
+                if timeout is not None
+            ]
+            return min(timeouts) if timeouts else None
+
         http_server.serve_forever(
-            on_poll=inverter.run_maintenance,
-            get_poll_timeout=inverter.next_maintenance_timeout,
+            on_poll=run_maintenance,
+            get_poll_timeout=next_maintenance_timeout,
         )
     except KeyboardInterrupt:
         logger.info("Interrupted; shutting down")
     except Exception as exc:  # pylint: disable=broad-except
         logger.error("%s", exc)
     finally:
+        try:
+            if mqtt_service:
+                mqtt_service.stop()
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.error("Failed to close MQTT client: %s", exc)
+
         try:
             if http_server:
                 http_server.server_close()

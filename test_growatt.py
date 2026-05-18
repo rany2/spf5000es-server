@@ -3,6 +3,7 @@
 """Tests for Modbus validation and recovery behavior."""
 
 import base64
+import json
 from datetime import datetime
 from http.client import HTTPConnection
 from http import HTTPStatus
@@ -24,6 +25,8 @@ from growatt import (
     GrowattHTTPHandler,
     GrowattHTTPServer,
     GrowattInverter,
+    GrowattMqttConfig,
+    GrowattMqttService,
     GrowattModbusClient,
     ModbusAppConfig,
     WriteQueueFullError,
@@ -152,6 +155,65 @@ class FakeTimeSyncInverter:  # pylint: disable=too-few-public-methods
         return self.values
 
 
+class FakeMqttClient:
+    """Small fake for exercising MQTT discovery without a broker."""
+
+    def __init__(self, *args, **kwargs):
+        self.args = args
+        self.kwargs = kwargs
+        self.published = []
+        self.subscriptions = []
+        self.username = None
+        self.password = None
+        self.will = None
+        self.on_connect = None
+        self.on_disconnect = None
+        self.on_message = None
+
+    def username_pw_set(self, username, password=None):
+        """Record configured credentials."""
+
+        self.username = username
+        self.password = password
+
+    def will_set(self, topic, payload=None, retain=False):
+        """Record the configured LWT."""
+
+        self.will = (topic, payload, retain)
+
+    def connect(self, host, port, keepalive):
+        """Record a connect request."""
+
+        self.connect_args = (host, port, keepalive)
+
+    def loop_start(self):
+        """Pretend to start the paho network loop."""
+
+    def loop_stop(self):
+        """Pretend to stop the paho network loop."""
+
+    def disconnect(self):
+        """Pretend to disconnect."""
+
+    def publish(self, topic, payload=None, retain=False):
+        """Record published MQTT messages."""
+
+        self.published.append((topic, payload, retain))
+
+    def subscribe(self, topic):
+        """Record MQTT subscriptions."""
+
+        self.subscriptions.append(topic)
+
+
+class FakeMqttMessage:  # pylint: disable=too-few-public-methods
+    """Small paho-like MQTT message."""
+
+    def __init__(self, topic, payload):
+        self.topic = topic
+        self.payload = payload.encode("utf-8")
+
+
 def build_basic_auth(username="admin", password="admin"):
     """Return a Basic authorization header value for tests."""
 
@@ -159,6 +221,29 @@ def build_basic_auth(username="admin", password="admin"):
         "ascii"
     )
     return f"Basic {credentials}"
+
+
+def make_mqtt_config(**overrides):
+    """Build a complete MQTT config for service tests."""
+
+    config = {
+        "enabled": True,
+        "host": "mqtt.local",
+        "port": 1883,
+        "username": None,
+        "password": None,
+        "client_id": "growatt-test",
+        "keepalive": 60,
+        "topic_prefix": "growatt/spf5000es",
+        "discovery_prefix": "homeassistant",
+        "device_id": "growatt_spf5000es",
+        "device_name": "Growatt SPF 5000 ES",
+        "retain": True,
+        "status_interval_sec": 10,
+        "config_interval_sec": 300,
+    }
+    config.update(overrides)
+    return GrowattMqttConfig(**config)
 
 
 class GrowattRecoveryTest(unittest.TestCase):
@@ -248,6 +333,73 @@ class GrowattRecoveryTest(unittest.TestCase):
         self.assertFalse(config.web.handler.x_forwarded_for)
         self.assertEqual(config.modbus.timeout_sec, 1.5)
         self.assertEqual(config.modbus.retries, 2)
+        self.assertFalse(config.mqtt.enabled)
+        self.assertEqual(config.mqtt.topic_prefix, "growatt_spf5000es")
+        self.assertIsNone(config.mqtt.username)
+
+    def test_mqtt_discovery_exposes_writable_selects(self):
+        """Home Assistant discovery should expose enum settings as selects."""
+
+        with patch("growatt.mqtt.Client", FakeMqttClient):
+            service = GrowattMqttService(Mock(), make_mqtt_config())
+
+        client = service._client  # pylint: disable=protected-access
+        service._on_connect(client, None, None, 0)  # pylint: disable=protected-access
+
+        self.assertIn(
+            "growatt/spf5000es/config/+/set",
+            client.subscriptions,
+        )
+        messages = {topic: payload for topic, payload, _retain in client.published}
+        topic = (
+            "homeassistant/select/growatt_spf5000es/"
+            "growatt_spf5000es_output_config/config"
+        )
+        payload = json.loads(messages[topic])
+
+        self.assertEqual(
+            payload["command_topic"],
+            "growatt/spf5000es/config/output_config/set",
+        )
+        self.assertEqual(
+            payload["state_topic"],
+            "growatt/spf5000es/config/output_config/state",
+        )
+        self.assertEqual(payload["options"], ["SBU", "SOL", "UTI", "SUB"])
+        self.assertEqual(payload["icon"], "mdi:transmission-tower-export")
+        self.assertEqual(payload["device"]["identifiers"], ["growatt_spf5000es"])
+
+        number_topic = (
+            "homeassistant/number/growatt_spf5000es/"
+            "growatt_spf5000es_max_charge_amps/config"
+        )
+        number_payload = json.loads(messages[number_topic])
+
+        self.assertEqual(number_payload["unit_of_measurement"], "A")
+        self.assertEqual(number_payload["device_class"], "current")
+        self.assertEqual(number_payload["icon"], "mdi:current-ac")
+
+        button_topic = (
+            "homeassistant/button/growatt_spf5000es/"
+            "growatt_spf5000es_sync_time/config"
+        )
+        button_payload = json.loads(messages[button_topic])
+        self.assertEqual(button_payload["icon"], "mdi:clock-sync-outline")
+
+    def test_mqtt_command_writes_config_register(self):
+        """MQTT config commands should flow through inverter write validation."""
+
+        inverter = Mock()
+        with patch("growatt.mqtt.Client", FakeMqttClient):
+            service = GrowattMqttService(inverter, make_mqtt_config())
+
+        service._on_message(  # pylint: disable=protected-access
+            service._client,  # pylint: disable=protected-access
+            None,
+            FakeMqttMessage("growatt/spf5000es/config/output_config/set", "SBU"),
+        )
+
+        inverter.write_config.assert_called_once_with("OutputConfig", "SBU")
 
     def test_http_server_serves_second_client_while_first_is_idle(self):
         """An idle TCP client should not monopolize the HTTP accept loop."""
