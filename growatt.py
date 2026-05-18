@@ -399,6 +399,15 @@ MQTT_ENTITY_METADATA = {
     "LiProtocolType": {"icon": "mdi:protocol"},
 }
 
+CONFIG_NUMBER_LIMITS = {
+    "SysYear": {"min": 2000, "max": 2099, "step": 1},
+    "SysMonth": {"min": 1, "max": 12, "step": 1},
+    "SysDay": {"min": 1, "max": 31, "step": 1},
+    "SysHour": {"min": 0, "max": 23, "step": 1},
+    "SysMin": {"min": 0, "max": 59, "step": 1},
+    "SysSec": {"min": 0, "max": 59, "step": 1},
+}
+
 
 class WriteQueueFullError(RuntimeError):
     """Raised when the pending Modbus write queue is full."""
@@ -1623,6 +1632,9 @@ class GrowattMqttService:
         if type_ == RegType.CHAR:
             return "text", payload
 
+        payload.update(
+            CONFIG_NUMBER_LIMITS.get(key, {"min": 0, "max": 65535, "step": 1})
+        )
         payload["mode"] = "box"
         return "number", payload
 

@@ -340,6 +340,52 @@ class GrowattRecoveryTest(unittest.TestCase):
         button_payload = json.loads(messages[button_topic])
         self.assertEqual(button_payload["icon"], "mdi:clock-sync-outline")
 
+    def test_mqtt_discovery_sets_sys_year_number_limits(self):
+        """Clock number entities should accept real year values in Home Assistant."""
+
+        with patch("growatt.mqtt.Client", FakeMqttClient):
+            service = GrowattMqttService(Mock(), make_mqtt_config())
+
+        client = service._client  # pylint: disable=protected-access
+        service._on_connect(client, None, None, 0)  # pylint: disable=protected-access
+
+        messages = {topic: payload for topic, payload, _retain in client.published}
+        topic = (
+            "homeassistant/number/growatt_spf5000es/"
+            "growatt_spf5000es_sys_year/config"
+        )
+        payload = json.loads(messages[topic])
+
+        self.assertEqual(
+            payload["state_topic"], "growatt/spf5000es/config/sys_year/state"
+        )
+        self.assertEqual(
+            payload["command_topic"], "growatt/spf5000es/config/sys_year/set"
+        )
+        self.assertEqual(payload["min"], 2000)
+        self.assertEqual(payload["max"], 2099)
+        self.assertEqual(payload["step"], 1)
+
+    def test_mqtt_discovery_sets_generic_number_limits(self):
+        """Generic numeric config entities should accept full UINT register values."""
+
+        with patch("growatt.mqtt.Client", FakeMqttClient):
+            service = GrowattMqttService(Mock(), make_mqtt_config())
+
+        client = service._client  # pylint: disable=protected-access
+        service._on_connect(client, None, None, 0)  # pylint: disable=protected-access
+
+        messages = {topic: payload for topic, payload, _retain in client.published}
+        for slug in ("flash_start", "function_mask", "uw_bat_piece_num"):
+            topic = (
+                "homeassistant/number/growatt_spf5000es/"
+                f"growatt_spf5000es_{slug}/config"
+            )
+            payload = json.loads(messages[topic])
+            self.assertEqual(payload["min"], 0)
+            self.assertEqual(payload["max"], 65535)
+            self.assertEqual(payload["step"], 1)
+
     def test_mqtt_command_writes_config_register(self):
         """MQTT config commands should flow through inverter write validation."""
 
