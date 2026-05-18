@@ -1571,8 +1571,10 @@ class GrowattMqttService:
 
         if not has_current or not char.isupper():
             return False
-        return previous.islower() or previous.isdigit() or (
-            previous.isupper() and next_char.islower()
+        return (
+            previous.islower()
+            or previous.isdigit()
+            or (previous.isupper() and next_char.islower())
         )
 
     @staticmethod
@@ -1585,7 +1587,9 @@ class GrowattMqttService:
             previous = value[index - 1] if index else ""
             next_char = value[index + 1] if index + 1 < len(value) else ""
             if (
-                GrowattMqttService._is_word_boundary(previous, char, next_char, bool(index))
+                GrowattMqttService._is_word_boundary(
+                    previous, char, next_char, bool(index)
+                )
                 and not previous_separator
             ):
                 output.append("_")
@@ -1641,8 +1645,9 @@ class GrowattMqttService:
             (
                 (
                     "seconds",
-                    lambda value: "time" in value
-                    and ("volt" in value or "freq" in value),
+                    lambda value: (
+                        "time" in value and ("volt" in value or "freq" in value)
+                    ),
                 ),
                 {
                     "device_class": "duration",
@@ -1848,11 +1853,17 @@ class GrowattMqttService:
             return
         key_slug = topic[len(prefix) : -len(suffix)]
         key = next(
-            (name for name in HOLDING_AND_WRITE_REGISTERS if self._slug(name) == key_slug),
+            (
+                name
+                for name in HOLDING_AND_WRITE_REGISTERS
+                if self._slug(name) == key_slug
+            ),
             None,
         )
         if key is None:
-            logger.warning("Ignoring MQTT command for unknown config key topic=%s", topic)
+            logger.warning(
+                "Ignoring MQTT command for unknown config key topic=%s", topic
+            )
             return
 
         try:
@@ -2136,7 +2147,7 @@ def read_app_config(config_path: str = "config.ini") -> GrowattAppConfig:
             port=cfg.get("MODBUS", "PORT"),
             write_queue_size=cfg.getint("MODBUS", "WRITE_QUEUE_SIZE", fallback=128),
             write_batch_delay_sec=cfg.getfloat(
-                "MODBUS", "WRITE_BATCH_DELAY_SEC", fallback=0.05
+                "MODBUS", "WRITE_BATCH_DELAY_SEC", fallback=0.25
             ),
             timeout_sec=cfg.getfloat("MODBUS", "TIMEOUT_SEC", fallback=1.5),
             retries=cfg.getint("MODBUS", "RETRIES", fallback=2),

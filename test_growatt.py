@@ -31,7 +31,7 @@ def make_modbus_config(**overrides):
     config = {
         "port": "/dev/null",
         "write_queue_size": 128,
-        "write_batch_delay_sec": 0.05,
+        "write_batch_delay_sec": 0.25,
         "timeout_sec": 1.5,
         "retries": 2,
         "reconnect_delay_sec": 0.2,
@@ -322,6 +322,7 @@ class GrowattRecoveryTest(unittest.TestCase):  # pylint: disable=too-many-public
 
         self.assertEqual(config.modbus.timeout_sec, 1.5)
         self.assertEqual(config.modbus.retries, 2)
+        self.assertEqual(config.modbus.write_batch_delay_sec, 0.25)
         self.assertEqual(config.mqtt.topic_prefix, "growatt_spf5000es")
         self.assertIsNone(config.mqtt.username)
         self.assertEqual(config.mqtt.config_interval_sec, 1800.0)
@@ -369,8 +370,7 @@ class GrowattRecoveryTest(unittest.TestCase):  # pylint: disable=too-many-public
         self.assertEqual(number_payload["icon"], "mdi:current-ac")
 
         button_topic = (
-            "homeassistant/button/growatt_spf5000es/"
-            "growatt_spf5000es_sync_time/config"
+            "homeassistant/button/growatt_spf5000es/growatt_spf5000es_sync_time/config"
         )
         button_payload = json.loads(messages[button_topic])
         self.assertEqual(button_payload["icon"], "mdi:clock-sync-outline")
@@ -386,8 +386,7 @@ class GrowattRecoveryTest(unittest.TestCase):  # pylint: disable=too-many-public
 
         messages = {topic: payload for topic, payload, _retain in client.published}
         topic = (
-            "homeassistant/number/growatt_spf5000es/"
-            "growatt_spf5000es_sys_year/config"
+            "homeassistant/number/growatt_spf5000es/growatt_spf5000es_sys_year/config"
         )
         payload = json.loads(messages[topic])
 
