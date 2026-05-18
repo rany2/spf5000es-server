@@ -1526,14 +1526,12 @@ class GrowattMqttConfig:  # pylint: disable=too-many-instance-attributes
     device_id: str
     device_name: str
     retain: bool
-    status_interval_sec: float
     config_interval_sec: float
 
     def __post_init__(self):
         """Normalize timing and topic config."""
 
         self.keepalive = max(1, self.keepalive)
-        self.status_interval_sec = max(1.0, self.status_interval_sec)
         self.config_interval_sec = max(1.0, self.config_interval_sec)
         self.topic_prefix = self.topic_prefix.strip("/") or self.device_id
         self.discovery_prefix = self.discovery_prefix.strip("/") or "homeassistant"
@@ -1541,6 +1539,9 @@ class GrowattMqttConfig:  # pylint: disable=too-many-instance-attributes
 
 class GrowattMqttService:
     """Publish inverter state and accept config writes over MQTT."""
+
+    STATUS_INTERVAL_SEC = 1.0
+    STATUS_MAX_STALE_SEC = 6.0
 
     def __init__(self, inverter: GrowattInverter, config: GrowattMqttConfig):
         self.inverter = inverter
@@ -1995,12 +1996,37 @@ class GrowattMqttService:
         now = perf_counter()
         if not self._discovery_published:
             return
-        if self._next_status_publish is not None and now >= self._next_status_publish:
+
+        status_due = (
+            self._next_status_publish is not None and now >= self._next_status_publish
+        )
+        config_due = (
+            self._next_config_publish is not None and now >= self._next_config_publish
+        )
+        status_stale = (
+            self._next_status_publish is not None
+            and now >= self._next_status_publish + self.STATUS_MAX_STALE_SEC
+        )
+
+        if status_due and (not config_due or status_stale):
             self.publish_status()
-            self._next_status_publish = now + self.config.status_interval_sec
-        if self._next_config_publish is not None and now >= self._next_config_publish:
+            self._next_status_publish = now + self.STATUS_INTERVAL_SEC
+            status_due = False
+
+        if config_due:
             self.publish_config()
             self._next_config_publish = now + self.config.config_interval_sec
+
+        if status_due:
+            self.publish_status()
+            self._next_status_publish = now + self.STATUS_INTERVAL_SEC
+
+    def is_status_publish_stale(self) -> bool:
+        """Return whether status has reached its maximum allowed staleness."""
+
+        if not self._discovery_published or self._next_status_publish is None:
+            return False
+        return perf_counter() >= self._next_status_publish + self.STATUS_MAX_STALE_SEC
 
     def next_maintenance_timeout(self) -> Optional[float]:
         """Return seconds until the next MQTT publish is due."""
@@ -2107,11 +2133,8 @@ def read_app_config(config_path: str = "config.ini") -> GrowattAppConfig:
             device_id=mqtt_device_id,
             device_name=cfg.get("MQTT", "DEVICE_NAME", fallback="Growatt SPF 5000 ES"),
             retain=cfg.getboolean("MQTT", "RETAIN", fallback=True),
-            status_interval_sec=cfg.getfloat(
-                "MQTT", "STATUS_INTERVAL_SEC", fallback=10.0
-            ),
             config_interval_sec=cfg.getfloat(
-                "MQTT", "CONFIG_INTERVAL_SEC", fallback=300.0
+                "MQTT", "CONFIG_INTERVAL_SEC", fallback=1800.0
             ),
         ),
         log_level=cfg.get("LOGGING", "LEVEL", fallback="INFO"),
@@ -2140,6 +2163,8 @@ def main():
         mqtt_service.start()
 
         def run_maintenance():
+            if mqtt_service and mqtt_service.is_status_publish_stale():
+                mqtt_service.run_maintenance()
             inverter.run_maintenance()
             if mqtt_service:
                 mqtt_service.run_maintenance()

@@ -204,7 +204,6 @@ def make_mqtt_config(**overrides):
         "device_id": "growatt_spf5000es",
         "device_name": "Growatt SPF 5000 ES",
         "retain": True,
-        "status_interval_sec": 10,
         "config_interval_sec": 300,
     }
     config.update(overrides)
@@ -315,6 +314,7 @@ class GrowattRecoveryTest(unittest.TestCase):
         self.assertEqual(config.modbus.retries, 2)
         self.assertEqual(config.mqtt.topic_prefix, "growatt_spf5000es")
         self.assertIsNone(config.mqtt.username)
+        self.assertEqual(config.mqtt.config_interval_sec, 1800.0)
 
     def test_mqtt_discovery_exposes_writable_selects(self):
         """Home Assistant discovery should expose enum settings as selects."""
@@ -479,6 +479,70 @@ class GrowattRecoveryTest(unittest.TestCase):
         )
 
         inverter.write_config.assert_called_once_with("OutputConfig", "SBU")
+
+    def test_mqtt_config_publish_preempts_status_within_stale_limit(self):
+        """A due config read should run before status while status is fresh enough."""
+
+        inverter = Mock()
+        inverter.read_status.return_value = {"SystemStatus": "Standby"}
+        inverter.read_config.return_value = {"OutputConfig": "SBU"}
+        with patch("growatt.mqtt.Client", FakeMqttClient):
+            service = GrowattMqttService(inverter, make_mqtt_config())
+        service._discovery_published = True  # pylint: disable=protected-access
+        service._next_status_publish = 100.0  # pylint: disable=protected-access
+        service._next_config_publish = 100.0  # pylint: disable=protected-access
+
+        with patch("growatt.perf_counter", return_value=105.0):
+            service.run_maintenance()
+
+        client = service._client  # pylint: disable=protected-access
+        topics = [topic for topic, _payload, _retain in client.published]
+        self.assertEqual(
+            topics,
+            [
+                "growatt/spf5000es/config/output_config/state",
+                "growatt/spf5000es/status/system_status/state",
+            ],
+        )
+
+    def test_mqtt_status_publish_preempts_config_after_stale_limit(self):
+        """Status should not remain stale beyond six seconds for a config read."""
+
+        inverter = Mock()
+        inverter.read_status.return_value = {"SystemStatus": "Standby"}
+        inverter.read_config.return_value = {"OutputConfig": "SBU"}
+        with patch("growatt.mqtt.Client", FakeMqttClient):
+            service = GrowattMqttService(inverter, make_mqtt_config())
+        service._discovery_published = True  # pylint: disable=protected-access
+        service._next_status_publish = 100.0  # pylint: disable=protected-access
+        service._next_config_publish = 100.0  # pylint: disable=protected-access
+
+        with patch("growatt.perf_counter", return_value=106.0):
+            service.run_maintenance()
+
+        client = service._client  # pylint: disable=protected-access
+        topics = [topic for topic, _payload, _retain in client.published]
+        self.assertEqual(
+            topics,
+            [
+                "growatt/spf5000es/status/system_status/state",
+                "growatt/spf5000es/config/output_config/state",
+            ],
+        )
+
+    def test_mqtt_status_stale_check_uses_six_second_limit(self):
+        """The service should expose the six second status deferral limit."""
+
+        inverter = Mock()
+        with patch("growatt.mqtt.Client", FakeMqttClient):
+            service = GrowattMqttService(inverter, make_mqtt_config())
+        service._discovery_published = True  # pylint: disable=protected-access
+        service._next_status_publish = 100.0  # pylint: disable=protected-access
+
+        with patch("growatt.perf_counter", return_value=105.999):
+            self.assertFalse(service.is_status_publish_stale())
+        with patch("growatt.perf_counter", return_value=106.0):
+            self.assertTrue(service.is_status_publish_stale())
 
     def test_run_maintenance_flushes_queued_writes(self):
         """Queued writes should flush from the maintenance hook."""
