@@ -1387,9 +1387,7 @@ class GrowattMqttService:
                     "device_class": "energy",
                     "icon": "mdi:lightning-bolt",
                     "unit_of_measurement": "kWh",
-                    "state_class": "total_increasing"
-                    if "total" in lower_key
-                    else "measurement",
+                    "state_class": "total_increasing",
                 }
             )
         elif "seconds" in lower_key:

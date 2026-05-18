@@ -386,6 +386,26 @@ class GrowattRecoveryTest(unittest.TestCase):
             self.assertEqual(payload["max"], 65535)
             self.assertEqual(payload["step"], 1)
 
+    def test_mqtt_discovery_sets_energy_state_class_total_increasing(self):
+        """Energy sensors should use a Home Assistant-compatible state class."""
+
+        with patch("growatt.mqtt.Client", FakeMqttClient):
+            service = GrowattMqttService(Mock(), make_mqtt_config())
+
+        client = service._client  # pylint: disable=protected-access
+        service._on_connect(client, None, None, 0)  # pylint: disable=protected-access
+
+        messages = {topic: payload for topic, payload, _retain in client.published}
+        for slug in ("pv2_energy_todayk_wh", "pv2_energy_totalk_wh"):
+            topic = (
+                "homeassistant/sensor/growatt_spf5000es/"
+                f"growatt_spf5000es_{slug}/config"
+            )
+            payload = json.loads(messages[topic])
+            self.assertEqual(payload["device_class"], "energy")
+            self.assertEqual(payload["unit_of_measurement"], "kWh")
+            self.assertEqual(payload["state_class"], "total_increasing")
+
     def test_mqtt_command_writes_config_register(self):
         """MQTT config commands should flow through inverter write validation."""
 
