@@ -1564,6 +1564,18 @@ class GrowattMqttService:
         return f"{self.base_topic}/availability"
 
     @staticmethod
+    def _is_word_boundary(
+        previous: str, char: str, next_char: str, has_current: bool = True
+    ) -> bool:
+        """Return whether an uppercase char starts a new register-name word."""
+
+        if not has_current or not char.isupper():
+            return False
+        return previous.islower() or previous.isdigit() or (
+            previous.isupper() and next_char.islower()
+        )
+
+    @staticmethod
     def _slug(value: str) -> str:
         """Create a Home Assistant-safe object id fragment."""
 
@@ -1573,13 +1585,7 @@ class GrowattMqttService:
             previous = value[index - 1] if index else ""
             next_char = value[index + 1] if index + 1 < len(value) else ""
             if (
-                index
-                and char.isupper()
-                and (
-                    previous.islower()
-                    or previous.isdigit()
-                    or (previous.isupper() and next_char.islower())
-                )
+                GrowattMqttService._is_word_boundary(previous, char, next_char, bool(index))
                 and not previous_separator
             ):
                 output.append("_")
@@ -1600,16 +1606,9 @@ class GrowattMqttService:
         for index, char in enumerate(value):
             previous = value[index - 1] if index else ""
             next_char = value[index + 1] if index + 1 < len(value) else ""
-            boundary = (
-                current
-                and char.isupper()
-                and (
-                    previous.islower()
-                    or previous.isdigit()
-                    or (previous.isupper() and next_char.islower())
-                )
-            )
-            if boundary:
+            if GrowattMqttService._is_word_boundary(
+                previous, char, next_char, bool(current)
+            ):
                 words.append(current)
                 current = char
             else:
@@ -1638,94 +1637,116 @@ class GrowattMqttService:
 
         metadata: Dict[str, str] = dict(MQTT_ENTITY_METADATA.get(key, {}))
         lower_key = key.lower()
-        if "temp" in lower_key and lower_key.endswith("c"):
-            metadata.update(
+        for matches, inferred_metadata in (
+            (
+                (
+                    "seconds",
+                    lambda value: "time" in value
+                    and ("volt" in value or "freq" in value),
+                ),
                 {
-                    "device_class": "temperature",
-                    "icon": "mdi:thermometer",
-                    "unit_of_measurement": "°C",
-                }
-            )
-        elif "volt" in lower_key:
-            metadata.update(
-                {
-                    "device_class": "voltage",
-                    "icon": "mdi:sine-wave",
-                    "unit_of_measurement": "V",
-                }
-            )
-        elif "watt" in lower_key:
-            metadata.update(
-                {
-                    "device_class": "power",
-                    "icon": "mdi:flash",
-                    "unit_of_measurement": "W",
-                }
-            )
-        elif lower_key.endswith("va"):
-            metadata.update(
-                {
-                    "device_class": "apparent_power",
-                    "icon": "mdi:flash-triangle-outline",
-                    "unit_of_measurement": "VA",
-                }
-            )
-        elif "amps" in lower_key:
-            metadata.update(
-                {
-                    "device_class": "current",
-                    "icon": "mdi:current-ac",
-                    "unit_of_measurement": "A",
-                }
-            )
-        elif "freq" in lower_key:
-            metadata.update(
-                {
-                    "device_class": "frequency",
-                    "icon": "mdi:sine-wave",
-                    "unit_of_measurement": "Hz",
-                }
-            )
-        elif "percent" in lower_key or lower_key.endswith("soc"):
-            metadata.update(
-                {
-                    "icon": "mdi:percent-outline",
-                    "unit_of_measurement": "%",
-                }
-            )
-        elif lower_key.endswith("kwh"):
-            metadata.update(
+                    "device_class": "duration",
+                    "icon": "mdi:timer-outline",
+                    "unit_of_measurement": "s",
+                },
+            ),
+            (
+                (lambda value: value.endswith("kwh"),),
                 {
                     "device_class": "energy",
                     "icon": "mdi:lightning-bolt",
                     "unit_of_measurement": "kWh",
                     "state_class": "total_increasing",
-                }
-            )
-        elif "seconds" in lower_key:
-            metadata.update(
+                },
+            ),
+            (
+                (lambda value: value.endswith("kw"),),
                 {
-                    "device_class": "duration",
-                    "icon": "mdi:timer-outline",
-                    "unit_of_measurement": "s",
-                }
-            )
-        elif "fan" in lower_key:
-            metadata.setdefault("icon", "mdi:fan")
-        elif "battery" in lower_key or lower_key.startswith("bat"):
-            metadata.setdefault("icon", "mdi:battery")
-        elif "pv" in lower_key:
-            metadata.setdefault("icon", "mdi:solar-panel")
-        elif "grid" in lower_key or "uti" in lower_key:
-            metadata.setdefault("icon", "mdi:transmission-tower")
-        elif "output" in lower_key:
-            metadata.setdefault("icon", "mdi:power-plug-outline")
-        elif "buzzer" in lower_key or "alarm" in lower_key:
-            metadata.setdefault("icon", "mdi:bell-ring-outline")
-        elif "restart" in lower_key or "reset" in lower_key:
-            metadata.setdefault("icon", "mdi:restart")
-        elif "enable" in lower_key:
-            metadata.setdefault("icon", "mdi:toggle-switch-outline")
+                    "device_class": "power",
+                    "icon": "mdi:flash",
+                    "unit_of_measurement": "kW",
+                },
+            ),
+            (
+                ("percent", lambda value: value.endswith("soc")),
+                {
+                    "icon": "mdi:percent-outline",
+                    "unit_of_measurement": "%",
+                },
+            ),
+            (
+                (lambda value: "temp" in value and value.endswith("c"),),
+                {
+                    "device_class": "temperature",
+                    "icon": "mdi:thermometer",
+                    "unit_of_measurement": "°C",
+                },
+            ),
+            (
+                ("watt",),
+                {
+                    "device_class": "power",
+                    "icon": "mdi:flash",
+                    "unit_of_measurement": "W",
+                },
+            ),
+            (
+                ("volt",),
+                {
+                    "device_class": "voltage",
+                    "icon": "mdi:sine-wave",
+                    "unit_of_measurement": "V",
+                },
+            ),
+            (
+                (lambda value: value.endswith("va"),),
+                {
+                    "device_class": "apparent_power",
+                    "icon": "mdi:flash-triangle-outline",
+                    "unit_of_measurement": "VA",
+                },
+            ),
+            (
+                ("amps",),
+                {
+                    "device_class": "current",
+                    "icon": "mdi:current-ac",
+                    "unit_of_measurement": "A",
+                },
+            ),
+            (
+                ("freq",),
+                {
+                    "device_class": "frequency",
+                    "icon": "mdi:sine-wave",
+                    "unit_of_measurement": "Hz",
+                },
+            ),
+        ):
+            if any(
+                match(lower_key) if callable(match) else match in lower_key
+                for match in matches
+            ):
+                metadata.update(inferred_metadata)
+                break
+
+        for matches, icon in (
+            (("fan",), "mdi:fan"),
+            (("battery", lambda value: value.startswith("bat")), "mdi:battery"),
+            (("pv",), "mdi:solar-panel"),
+            (("grid", "uti"), "mdi:transmission-tower"),
+            (("output",), "mdi:power-plug-outline"),
+            (("buzzer", "alarm"), "mdi:bell-ring-outline"),
+            (("restart", "reset"), "mdi:restart"),
+            (("enable",), "mdi:toggle-switch-outline"),
+        ):
+            if "icon" in metadata:
+                break
+            if any(
+                match(lower_key) if callable(match) else match in lower_key
+                for match in matches
+            ):
+                metadata["icon"] = icon
 
         if (
             "unit_of_measurement" in metadata
@@ -1934,24 +1955,24 @@ class GrowattMqttService:
                 }
             )
             if not writable:
-                return "binary_sensor", payload
-            payload.update(
-                {
-                    "state_on": "true",
-                    "state_off": "false",
-                }
-            )
-            return "switch", payload
-
-        payload.update(self._sensor_metadata(key))
-
-        if not writable:
-            return "sensor", payload
-
-        if key in CONFIG_SELECT_OPTIONS:
+                component = "binary_sensor"
+            else:
+                payload.update(
+                    {
+                        "state_on": "true",
+                        "state_off": "false",
+                    }
+                )
+                component = "switch"
+        elif not writable:
+            payload.update(self._sensor_metadata(key))
+            component = "sensor"
+        elif key in CONFIG_SELECT_OPTIONS:
+            payload.update(self._sensor_metadata(key))
             payload["options"] = CONFIG_SELECT_OPTIONS[key]
-            return "select", payload
-        if key in CONFIG_BOOLEAN_KEYS:
+            component = "select"
+        elif key in CONFIG_BOOLEAN_KEYS:
+            payload.update(self._sensor_metadata(key))
             payload.update(
                 {
                     "payload_on": "true",
@@ -1960,15 +1981,19 @@ class GrowattMqttService:
                     "state_off": "false",
                 }
             )
-            return "switch", payload
-        if type_ == RegType.CHAR:
-            return "text", payload
+            component = "switch"
+        elif type_ == RegType.CHAR:
+            payload.update(self._sensor_metadata(key))
+            component = "text"
+        else:
+            payload.update(self._sensor_metadata(key))
+            payload.update(
+                CONFIG_NUMBER_LIMITS.get(key, {"min": 0, "max": 65535, "step": 1})
+            )
+            payload["mode"] = "box"
+            component = "number"
 
-        payload.update(
-            CONFIG_NUMBER_LIMITS.get(key, {"min": 0, "max": 65535, "step": 1})
-        )
-        payload["mode"] = "box"
-        return "number", payload
+        return component, payload
 
     def _publish_discovery_payload(
         self, component: str, object_id: str, payload: Dict[str, Any]

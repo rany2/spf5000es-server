@@ -7,6 +7,7 @@ from datetime import datetime
 import tempfile
 import textwrap
 import unittest
+from typing import TYPE_CHECKING
 from unittest.mock import Mock, patch
 
 from pymodbus.exceptions import ModbusException
@@ -130,7 +131,7 @@ class FakeGrowattClient:  # pylint: disable=too-few-public-methods
         self.ready_waits += 1
 
 
-class FakeMqttClient:
+class FakeMqttClient:  # pylint: disable=too-many-instance-attributes
     """Small fake for exercising MQTT discovery without a broker."""
 
     def __init__(self, *args, **kwargs):
@@ -141,6 +142,7 @@ class FakeMqttClient:
         self.username = None
         self.password = None
         self.will = None
+        self.connect_args = None
         self.on_connect = None
         self.on_disconnect = None
         self.on_message = None
@@ -181,6 +183,14 @@ class FakeMqttClient:
         self.subscriptions.append(topic)
 
 
+def fake_mqtt_client(service: GrowattMqttService) -> FakeMqttClient:
+    """Return the patched MQTT client with its test-only recording attributes."""
+
+    if TYPE_CHECKING:
+        return FakeMqttClient()
+    return getattr(service, "_client")
+
+
 class FakeMqttMessage:  # pylint: disable=too-few-public-methods
     """Small paho-like MQTT message."""
 
@@ -210,7 +220,7 @@ def make_mqtt_config(**overrides):
     return GrowattMqttConfig(**config)
 
 
-class GrowattRecoveryTest(unittest.TestCase):
+class GrowattRecoveryTest(unittest.TestCase):  # pylint: disable=too-many-public-methods
     """Regression tests for Modbus recovery paths."""
 
     def test_read_retries_after_empty_response(self):
@@ -322,7 +332,7 @@ class GrowattRecoveryTest(unittest.TestCase):
         with patch("growatt.mqtt.Client", FakeMqttClient):
             service = GrowattMqttService(Mock(), make_mqtt_config())
 
-        client = service._client  # pylint: disable=protected-access
+        client = fake_mqtt_client(service)
         service._on_connect(client, None, None, 0)  # pylint: disable=protected-access
 
         self.assertIn(
@@ -371,7 +381,7 @@ class GrowattRecoveryTest(unittest.TestCase):
         with patch("growatt.mqtt.Client", FakeMqttClient):
             service = GrowattMqttService(Mock(), make_mqtt_config())
 
-        client = service._client  # pylint: disable=protected-access
+        client = fake_mqtt_client(service)
         service._on_connect(client, None, None, 0)  # pylint: disable=protected-access
 
         messages = {topic: payload for topic, payload, _retain in client.published}
@@ -397,7 +407,7 @@ class GrowattRecoveryTest(unittest.TestCase):
         with patch("growatt.mqtt.Client", FakeMqttClient):
             service = GrowattMqttService(Mock(), make_mqtt_config())
 
-        client = service._client  # pylint: disable=protected-access
+        client = fake_mqtt_client(service)
         service._on_connect(client, None, None, 0)  # pylint: disable=protected-access
 
         messages = {topic: payload for topic, payload, _retain in client.published}
@@ -417,7 +427,7 @@ class GrowattRecoveryTest(unittest.TestCase):
         with patch("growatt.mqtt.Client", FakeMqttClient):
             service = GrowattMqttService(Mock(), make_mqtt_config())
 
-        client = service._client  # pylint: disable=protected-access
+        client = fake_mqtt_client(service)
         service._on_connect(client, None, None, 0)  # pylint: disable=protected-access
 
         messages = {topic: payload for topic, payload, _retain in client.published}
@@ -451,7 +461,7 @@ class GrowattRecoveryTest(unittest.TestCase):
         with patch("growatt.mqtt.Client", FakeMqttClient):
             service = GrowattMqttService(Mock(), make_mqtt_config())
 
-        client = service._client  # pylint: disable=protected-access
+        client = fake_mqtt_client(service)
         service._on_connect(client, None, None, 0)  # pylint: disable=protected-access
 
         messages = {topic: payload for topic, payload, _retain in client.published}
@@ -464,6 +474,45 @@ class GrowattRecoveryTest(unittest.TestCase):
             self.assertEqual(payload["device_class"], "energy")
             self.assertEqual(payload["unit_of_measurement"], "kWh")
             self.assertEqual(payload["state_class"], "total_increasing")
+
+    def test_mqtt_discovery_sets_battery_soc_as_percent(self):
+        """BatterySOC should not be mistaken for a Celsius temperature sensor."""
+
+        with patch("growatt.mqtt.Client", FakeMqttClient):
+            service = GrowattMqttService(Mock(), make_mqtt_config())
+
+        client = fake_mqtt_client(service)
+        service._on_connect(client, None, None, 0)  # pylint: disable=protected-access
+
+        messages = {topic: payload for topic, payload, _retain in client.published}
+        topic = (
+            "homeassistant/sensor/growatt_spf5000es/"
+            "growatt_spf5000es_battery_soc/config"
+        )
+        payload = json.loads(messages[topic])
+
+        self.assertEqual(payload["unit_of_measurement"], "%")
+        self.assertEqual(payload["icon"], "mdi:percent-outline")
+        self.assertNotEqual(payload.get("device_class"), "temperature")
+
+    def test_mqtt_metadata_prefers_specific_unit_suffixes(self):
+        """Specific unit suffixes should win over earlier words in register names."""
+
+        cases = {
+            "GridHighVoltLoadReductionWatt1": ("W", "power"),
+            "VoltLowLossPercent1": ("%", None),
+            "VoltHighLossPercent3": ("%", None),
+            "VoltLowLossTime1": ("s", "duration"),
+            "FreqReconnectTime": ("s", "duration"),
+            "PVLowLimitWattkW": ("kW", "power"),
+        }
+        for key, (unit, device_class) in cases.items():
+            with self.subTest(key=key):
+                metadata = GrowattMqttService._sensor_metadata(  # pylint: disable=protected-access
+                    key
+                )
+                self.assertEqual(metadata["unit_of_measurement"], unit)
+                self.assertEqual(metadata.get("device_class"), device_class)
 
     def test_mqtt_command_writes_config_register(self):
         """MQTT config commands should flow through inverter write validation."""
@@ -495,7 +544,7 @@ class GrowattRecoveryTest(unittest.TestCase):
         with patch("growatt.perf_counter", return_value=105.0):
             service.run_maintenance()
 
-        client = service._client  # pylint: disable=protected-access
+        client = fake_mqtt_client(service)
         topics = [topic for topic, _payload, _retain in client.published]
         self.assertEqual(
             topics,
@@ -520,7 +569,7 @@ class GrowattRecoveryTest(unittest.TestCase):
         with patch("growatt.perf_counter", return_value=106.0):
             service.run_maintenance()
 
-        client = service._client  # pylint: disable=protected-access
+        client = fake_mqtt_client(service)
         topics = [topic for topic, _payload, _retain in client.published]
         self.assertEqual(
             topics,
