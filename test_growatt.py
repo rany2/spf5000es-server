@@ -259,10 +259,24 @@ class GrowattRecoveryTest(unittest.TestCase):
     def test_register_read_windows_use_inverter_safe_spans(self):
         """Status and config reads should avoid oversized inverter requests."""
 
-        self.assertEqual(INPUT_REGISTER_WINDOWS, [(0, 45), (45, 45), (90, 18)])
+        self.assertEqual(
+            INPUT_REGISTER_WINDOWS,
+            [(0, 45), (45, 45), (90, 22), (200, 45), (245, 40)],
+        )
         self.assertEqual(
             HOLDING_REGISTER_WINDOWS,
-            [(0, 45), (45, 45), (90, 24), (162, 1)],
+            [
+                (0, 45),
+                (45, 45),
+                (90, 35),
+                (125, 45),
+                (170, 45),
+                (215, 9),
+                (300, 45),
+                (345, 45),
+                (390, 35),
+                (425, 2),
+            ],
         )
 
     def test_unknown_register_enum_is_modbus_error(self):
