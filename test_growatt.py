@@ -270,7 +270,7 @@ class GrowattRecoveryTest(unittest.TestCase):  # pylint: disable=too-many-public
 
         self.assertEqual(
             INPUT_REGISTER_WINDOWS,
-            [(0, 45), (45, 45), (90, 22), (200, 45), (245, 40)],
+            [(0, 45), (45, 44)],
         )
         self.assertEqual(
             HOLDING_REGISTER_WINDOWS,
