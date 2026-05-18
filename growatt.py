@@ -1370,7 +1370,7 @@ class GrowattInverter:  # pylint: disable=too-many-instance-attributes
             start (int): The start index of the registers.
             length (int): The number of registers to convert."""
         data = GrowattInverter.registers_to_bytes(registers, start, length)
-        return data.decode("utf-8")
+        return data.rstrip(b"\x00").decode("utf-8", errors="replace")
 
     @staticmethod
     def generic_read_postprocess(

@@ -287,6 +287,14 @@ class GrowattRecoveryTest(unittest.TestCase):
                 "SystemStatus", 999, {0: "Standby"}.__getitem__
             )
 
+    def test_char_registers_tolerate_invalid_utf8(self):
+        """Text-like device registers may contain arbitrary non-UTF-8 bytes."""
+
+        self.assertEqual(
+            GrowattInverter.registers_to_char([0x4142, 0xDD00, 0x0000], 0, 3),
+            "AB�",
+        )
+
     def test_legacy_config_uses_runtime_fallbacks(self):
         """Older configs that omit newer optional keys should still load."""
 
