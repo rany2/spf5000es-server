@@ -1901,6 +1901,8 @@ class GrowattMqttService:
             component, payload = self._config_entity_discovery_payload(key, item)
             object_id = payload["object_id"]
             self._publish_discovery_payload(component, object_id, payload)
+            if component != "sensor":
+                self._clear_discovery_payload("sensor", object_id)
 
         object_id = f"{self.config.device_id}_sync_time"
         payload = self._entity_base_payload(object_id, "Sync Time")
@@ -1914,17 +1916,37 @@ class GrowattMqttService:
     ) -> tuple[str, Dict[str, Any]]:
         """Build discovery payload for a config register."""
 
-        _, _, type_, _, writepreprocess = item
+        _, _, type_, readpreprocess, writepreprocess = item
         writable = writepreprocess is not None
         object_id = f"{self.config.device_id}_{self._slug(key)}"
         payload = self._entity_base_payload(object_id, self._friendly_name(key))
         payload["state_topic"] = self._value_topic(self.base_topic, "config", key)
+        if writable:
+            payload["command_topic"] = f"{self.base_topic}/config/{self._slug(key)}/set"
+
+        if readpreprocess is bool:
+            payload.update(
+                {
+                    "payload_on": "true",
+                    "payload_off": "false",
+                    "icon": "mdi:toggle-switch-outline",
+                }
+            )
+            if not writable:
+                return "binary_sensor", payload
+            payload.update(
+                {
+                    "state_on": "true",
+                    "state_off": "false",
+                }
+            )
+            return "switch", payload
+
         payload.update(self._sensor_metadata(key))
 
         if not writable:
             return "sensor", payload
 
-        payload["command_topic"] = f"{self.base_topic}/config/{self._slug(key)}/set"
         if key in CONFIG_SELECT_OPTIONS:
             payload["options"] = CONFIG_SELECT_OPTIONS[key]
             return "select", payload
@@ -1957,6 +1979,15 @@ class GrowattMqttService:
             f"{self.config.device_id}/{object_id}/config"
         )
         self._client.publish(topic, json_dumps(payload), retain=True)
+
+    def _clear_discovery_payload(self, component: str, object_id: str):
+        """Clear a retained Home Assistant discovery config payload."""
+
+        topic = (
+            f"{self.config.discovery_prefix.strip('/')}/{component}/"
+            f"{self.config.device_id}/{object_id}/config"
+        )
+        self._client.publish(topic, "", retain=True)
 
     def run_maintenance(self):
         """Publish scheduled status and config states."""

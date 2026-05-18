@@ -411,6 +411,40 @@ class GrowattRecoveryTest(unittest.TestCase):
             self.assertEqual(payload["max"], 65535)
             self.assertEqual(payload["step"], 1)
 
+    def test_mqtt_discovery_exposes_read_only_booleans_as_binary_sensors(self):
+        """Boolean config states should not be discovered as numeric sensors."""
+
+        with patch("growatt.mqtt.Client", FakeMqttClient):
+            service = GrowattMqttService(Mock(), make_mqtt_config())
+
+        client = service._client  # pylint: disable=protected-access
+        service._on_connect(client, None, None, 0)  # pylint: disable=protected-access
+
+        messages = {topic: payload for topic, payload, _retain in client.published}
+        for slug in (
+            "high_volt_load_reduction_enable",
+            "freq_load_reduction_enable",
+        ):
+            topic = (
+                "homeassistant/binary_sensor/growatt_spf5000es/"
+                f"growatt_spf5000es_{slug}/config"
+            )
+            payload = json.loads(messages[topic])
+            self.assertEqual(
+                payload["state_topic"], f"growatt/spf5000es/config/{slug}/state"
+            )
+            self.assertEqual(payload["payload_on"], "true")
+            self.assertEqual(payload["payload_off"], "false")
+            self.assertNotIn("device_class", payload)
+            self.assertNotIn("state_class", payload)
+            self.assertNotIn("unit_of_measurement", payload)
+
+            stale_sensor_topic = (
+                "homeassistant/sensor/growatt_spf5000es/"
+                f"growatt_spf5000es_{slug}/config"
+            )
+            self.assertEqual(messages[stale_sensor_topic], "")
+
     def test_mqtt_discovery_sets_energy_state_class_total_increasing(self):
         """Energy sensors should use a Home Assistant-compatible state class."""
 
