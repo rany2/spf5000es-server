@@ -187,22 +187,6 @@ INPUT_REGISTERS = {
     "TotalDischargeAmps": (84, 1, RegType.UINT, lambda x: x / 10),
     "OPDischargeEnergyTodaykWh": (85, 2, RegType.UINT, lambda x: x / 10),
     "OPDischargeEnergyTotalkWh": (87, 2, RegType.UINT, lambda x: x / 10),
-    "ParaChargeAmps": (90, 1, RegType.UINT, lambda x: x / 10),
-    "ParallelStatus": (91, 1, RegType.UINT, int),
-    "GeneratorEnergyTodaykWh": (92, 2, RegType.UINT, lambda x: x / 10),
-    "GeneratorEnergyTotalkWh": (94, 2, RegType.UINT, lambda x: x / 10),
-    "GeneratorWatt": (96, 1, RegType.UINT, int),
-    "GeneratorVolt": (97, 1, RegType.UINT, lambda x: x / 10),
-    "BatteryChargeEnergyTodaykWh": (98, 2, RegType.UINT, lambda x: x / 10),
-    "BatteryChargeEnergyTotalkWh": (100, 2, RegType.UINT, lambda x: x / 10),
-    "CTInputWatt": (102, 2, RegType.UINT, lambda x: x / 10),
-    "CTLoadWatt": (104, 2, RegType.UINT, lambda x: x / 10),
-    "CTLoadPercent": (106, 1, RegType.UINT, lambda x: x / 10),
-    "TransformerTempC": (107, 1, RegType.INT, lambda x: x / 10),
-    "LLCTempC": (108, 1, RegType.INT, lambda x: x / 10),
-    "LLCBusVolt": (109, 1, RegType.UINT, lambda x: x / 10),
-    "LLCBatteryVolt": (110, 1, RegType.UINT, lambda x: x / 100),
-    "EnvTempC": (111, 1, RegType.INT, lambda x: x / 10),
 }
 
 ## Holding Registers ##
