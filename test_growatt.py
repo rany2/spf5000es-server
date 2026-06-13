@@ -274,18 +274,7 @@ class GrowattRecoveryTest(unittest.TestCase):  # pylint: disable=too-many-public
         )
         self.assertEqual(
             HOLDING_REGISTER_WINDOWS,
-            [
-                (0, 45),
-                (45, 45),
-                (90, 35),
-                (125, 45),
-                (170, 45),
-                (215, 9),
-                (300, 45),
-                (345, 45),
-                (390, 35),
-                (425, 2),
-            ],
+            [(0, 45), (45, 45), (90, 18)],
         )
 
     def test_unknown_register_enum_is_modbus_error(self):
@@ -420,7 +409,7 @@ class GrowattRecoveryTest(unittest.TestCase):  # pylint: disable=too-many-public
             self.assertEqual(payload["max"], 65535)
             self.assertEqual(payload["step"], 1)
 
-    def test_mqtt_discovery_exposes_read_only_booleans_as_binary_sensors(self):
+    def test_mqtt_discovery_exposes_read_only_boolean_as_binary_sensor(self):
         """Boolean config states should not be discovered as numeric sensors."""
 
         with patch("growatt.mqtt.Client", FakeMqttClient):
@@ -430,10 +419,7 @@ class GrowattRecoveryTest(unittest.TestCase):  # pylint: disable=too-many-public
         service._on_connect(client, None, None, 0)  # pylint: disable=protected-access
 
         messages = {topic: payload for topic, payload, _retain in client.published}
-        for slug in (
-            "high_volt_load_reduction_enable",
-            "freq_load_reduction_enable",
-        ):
+        for slug in ("debug_mode_enable",):
             topic = (
                 "homeassistant/binary_sensor/growatt_spf5000es/"
                 f"growatt_spf5000es_{slug}/config"
