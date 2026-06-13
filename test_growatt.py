@@ -143,9 +143,15 @@ class FakeMqttClient:  # pylint: disable=too-many-instance-attributes
         self.password = None
         self.will = None
         self.connect_args = None
+        self.max_queued_messages = None
         self.on_connect = None
         self.on_disconnect = None
         self.on_message = None
+
+    def max_queued_messages_set(self, queue_size):
+        """Record outgoing queue sizing."""
+
+        self.max_queued_messages = queue_size
 
     def username_pw_set(self, username, password=None):
         """Record configured credentials."""
@@ -514,6 +520,34 @@ class GrowattRecoveryTest(unittest.TestCase):  # pylint: disable=too-many-public
 
         inverter.write_config.assert_called_once_with("OutputConfig", "SBU")
 
+    def test_mqtt_client_limits_offline_publish_queue(self):
+        """The MQTT client should not allow a large reconnect publish burst."""
+
+        with patch("growatt.mqtt.Client", FakeMqttClient):
+            service = GrowattMqttService(Mock(), make_mqtt_config())
+
+        self.assertEqual(fake_mqtt_client(service).max_queued_messages, 1)
+
+    def test_mqtt_maintenance_does_not_publish_while_disconnected(self):
+        """Offline maintenance should drop stale state instead of queueing it."""
+
+        inverter = Mock()
+        inverter.read_status.return_value = {"SystemStatus": "Standby"}
+        inverter.read_config.return_value = {"OutputConfig": "SBU"}
+        with patch("growatt.mqtt.Client", FakeMqttClient):
+            service = GrowattMqttService(inverter, make_mqtt_config())
+        service._discovery_published = True  # pylint: disable=protected-access
+        service._connected = False  # pylint: disable=protected-access
+        service._next_status_publish = 100.0  # pylint: disable=protected-access
+        service._next_config_publish = 100.0  # pylint: disable=protected-access
+
+        with patch("growatt.perf_counter", return_value=105.0):
+            service.run_maintenance()
+
+        inverter.read_status.assert_not_called()
+        inverter.read_config.assert_not_called()
+        self.assertEqual(fake_mqtt_client(service).published, [])
+
     def test_mqtt_config_publish_preempts_status_within_stale_limit(self):
         """A due config read should run before status while status is fresh enough."""
 
@@ -523,6 +557,7 @@ class GrowattRecoveryTest(unittest.TestCase):  # pylint: disable=too-many-public
         with patch("growatt.mqtt.Client", FakeMqttClient):
             service = GrowattMqttService(inverter, make_mqtt_config())
         service._discovery_published = True  # pylint: disable=protected-access
+        service._connected = True  # pylint: disable=protected-access
         service._next_status_publish = 100.0  # pylint: disable=protected-access
         service._next_config_publish = 100.0  # pylint: disable=protected-access
 
@@ -548,6 +583,7 @@ class GrowattRecoveryTest(unittest.TestCase):  # pylint: disable=too-many-public
         with patch("growatt.mqtt.Client", FakeMqttClient):
             service = GrowattMqttService(inverter, make_mqtt_config())
         service._discovery_published = True  # pylint: disable=protected-access
+        service._connected = True  # pylint: disable=protected-access
         service._next_status_publish = 100.0  # pylint: disable=protected-access
         service._next_config_publish = 100.0  # pylint: disable=protected-access
 
@@ -571,6 +607,7 @@ class GrowattRecoveryTest(unittest.TestCase):  # pylint: disable=too-many-public
         with patch("growatt.mqtt.Client", FakeMqttClient):
             service = GrowattMqttService(inverter, make_mqtt_config())
         service._discovery_published = True  # pylint: disable=protected-access
+        service._connected = True  # pylint: disable=protected-access
         service._next_status_publish = 100.0  # pylint: disable=protected-access
 
         with patch("growatt.perf_counter", return_value=105.999):

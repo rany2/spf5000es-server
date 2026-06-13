@@ -1288,6 +1288,7 @@ class GrowattMqttService:
         self._next_status_publish: Optional[float] = None
         self._next_config_publish: Optional[float] = None
         self._discovery_published = False
+        self._connected = False
 
     @property
     def base_topic(self) -> str:
@@ -1513,6 +1514,7 @@ class GrowattMqttService:
         if self.config.username is not None:
             client.username_pw_set(self.config.username, self.config.password)
         client.will_set(self.availability_topic, "offline", retain=True)
+        client.max_queued_messages_set(1)
         client.on_connect = self._on_connect
         client.on_disconnect = self._on_disconnect
         client.on_message = self._on_message
@@ -1552,8 +1554,10 @@ class GrowattMqttService:
             connected = str(reason_code).lower() == "success"
         if not connected:
             logger.error("MQTT connection failed reason=%s", reason_code)
+            self._connected = False
             return
         logger.info("MQTT connected")
+        self._connected = True
         client.publish(self.availability_topic, "online", retain=True)
         client.subscribe(f"{self.base_topic}/config/+/set")
         client.subscribe(f"{self.base_topic}/time_sync/set")
@@ -1572,6 +1576,7 @@ class GrowattMqttService:
     ):
         """Log MQTT disconnections."""
 
+        self._connected = False
         logger.warning("MQTT disconnected reason=%s", reason_code)
 
     def _on_message(self, _client, _userdata, message):
@@ -1768,7 +1773,7 @@ class GrowattMqttService:
         """Publish scheduled status and config states."""
 
         now = perf_counter()
-        if not self._discovery_published:
+        if not self._discovery_published or not self._connected:
             return
 
         status_due = (
@@ -1798,14 +1803,18 @@ class GrowattMqttService:
     def is_status_publish_stale(self) -> bool:
         """Return whether status has reached its maximum allowed staleness."""
 
-        if not self._discovery_published or self._next_status_publish is None:
+        if (
+            not self._discovery_published
+            or not self._connected
+            or self._next_status_publish is None
+        ):
             return False
         return perf_counter() >= self._next_status_publish + self.STATUS_MAX_STALE_SEC
 
     def next_maintenance_timeout(self) -> Optional[float]:
         """Return seconds until the next MQTT publish is due."""
 
-        if not self._discovery_published:
+        if not self._discovery_published or not self._connected:
             return None
         now = perf_counter()
         deadlines = [
@@ -1820,6 +1829,8 @@ class GrowattMqttService:
     def publish_status(self):
         """Read and publish status registers."""
 
+        if not self._connected:
+            return
         try:
             status = self.inverter.read_status()
         except ModbusException as exc:
@@ -1836,6 +1847,8 @@ class GrowattMqttService:
     def publish_config(self):
         """Read and publish config registers."""
 
+        if not self._connected:
+            return
         try:
             config = self.inverter.read_config()
         except ModbusException as exc:
