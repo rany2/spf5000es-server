@@ -857,6 +857,19 @@ class GrowattRecoveryTest(unittest.TestCase):  # pylint: disable=too-many-public
         )
         self.assertNotIn("availability_topic", payload)
 
+    def test_connect_failure_is_tolerated_and_time_sync_still_armed(self):
+        """A missing serial device at boot must not crash the service."""
+
+        scheduler = Scheduler(clock=FakeClock())
+        inverter = GrowattInverter(make_modbus_config(), scheduler)
+        failing_client = Mock()
+        failing_client.connect.side_effect = ModbusException("no such port")
+        inverter.client = failing_client
+
+        inverter.connect()
+
+        self.assertEqual(scheduler.next_timeout(), 0.0)
+
 
 class SchedulerTest(unittest.TestCase):
     """Tests for the cooperative deadline scheduler."""

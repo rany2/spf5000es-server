@@ -1017,11 +1017,20 @@ class GrowattInverter:  # pylint: disable=too-many-instance-attributes
         )
 
     def connect(self):
-        """Connect to the Modbus server and schedule maintenance work."""
+        """Open the serial port and schedule maintenance work.
+
+        A failed initial open is tolerated: every Modbus operation reopens
+        the port on failure, so the service self-heals once the device
+        appears."""
         logger.info("Connecting inverter")
-        self.client.connect()
+        try:
+            self.client.connect()
+            logger.info("Inverter connected")
+        except ModbusException as exc:
+            logger.error(
+                "Initial inverter connect failed; operations will retry: %s", exc
+            )
         self._scheduler.schedule(TASK_TIME_SYNC, 0.0)
-        logger.info("Inverter connected; initial time sync scheduled")
 
     def close(self):
         """Close the connection to the Modbus server."""
