@@ -529,19 +529,55 @@ class GrowattRecoveryTest(unittest.TestCase):  # pylint: disable=too-many-public
                 self.assertEqual(metadata["unit_of_measurement"], unit)
                 self.assertEqual(metadata.get("device_class"), device_class)
 
-    def test_mqtt_command_writes_config_register(self):
-        """MQTT config commands should flow through inverter write validation."""
+    def test_mqtt_command_is_handled_on_loop_thread(self):
+        """Commands must be queued by paho callbacks and run by the scheduler."""
 
         inverter = Mock()
-        service = make_mqtt_service(inverter=inverter)
+        scheduler = Scheduler(clock=FakeClock())
+        service = make_mqtt_service(inverter=inverter, scheduler=scheduler)
 
         service._on_message(  # pylint: disable=protected-access
             service._client,  # pylint: disable=protected-access
             None,
             FakeMqttMessage("growatt/spf5000es/config/output_config/set", "SBU"),
         )
+        inverter.write_config.assert_not_called()
 
+        scheduler.run_pending()
         inverter.write_config.assert_called_once_with("OutputConfig", "SBU")
+
+    def test_time_sync_command_runs_via_command_queue(self):
+        """The HA sync-time button must trigger sync on the loop thread."""
+
+        inverter = Mock()
+        scheduler = Scheduler(clock=FakeClock())
+        service = make_mqtt_service(inverter=inverter, scheduler=scheduler)
+
+        service._on_message(  # pylint: disable=protected-access
+            service._client,  # pylint: disable=protected-access
+            None,
+            FakeMqttMessage("growatt/spf5000es/time_sync/set", "sync"),
+        )
+        inverter.sync_time.assert_not_called()
+
+        scheduler.run_pending()
+        inverter.sync_time.assert_called_once()
+
+    def test_mqtt_command_queue_is_bounded(self):
+        """A hostile or looping publisher must not grow memory without bound."""
+
+        service = make_mqtt_service()
+        for _ in range(GrowattMqttService.COMMAND_QUEUE_MAX + 5):
+            service._on_message(  # pylint: disable=protected-access
+                service._client,  # pylint: disable=protected-access
+                None,
+                FakeMqttMessage("growatt/spf5000es/config/output_config/set", "SBU"),
+            )
+
+        self.assertEqual(
+            len(service._commands),  # pylint: disable=protected-access
+            GrowattMqttService.COMMAND_QUEUE_MAX,
+        )
 
     def test_mqtt_client_limits_offline_publish_queue(self):
         """The MQTT client should not allow a large reconnect publish burst."""

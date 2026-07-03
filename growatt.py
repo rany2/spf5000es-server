@@ -1409,6 +1409,7 @@ class GrowattMqttService:
     """Publish inverter state and accept config writes over MQTT."""
 
     STATUS_INTERVAL_SEC = 1.0
+    COMMAND_QUEUE_MAX = 32
 
     def __init__(
         self,
@@ -1427,6 +1428,11 @@ class GrowattMqttService:
         self._scheduler = scheduler
         self._client = self._make_client()
         self._connected = False
+        self._commands: deque[tuple[str, str]] = deque()
+        self._slug_to_config_key = {
+            self._slug(name): name for name in HOLDING_AND_WRITE_REGISTERS
+        }
+        scheduler.register(TASK_MQTT_COMMANDS, self._drain_commands, priority=20)
         scheduler.register(
             TASK_MQTT_CONFIG,
             self.publish_config,
@@ -1727,10 +1733,28 @@ class GrowattMqttService:
         logger.warning("MQTT disconnected reason=%s", reason_code)
 
     def _on_message(self, _client, _userdata, message):
-        """Handle Home Assistant command topics."""
+        """Queue Home Assistant commands for the service loop thread."""
 
-        topic = message.topic
         payload = message.payload.decode("utf-8", errors="replace").strip()
+        if len(self._commands) >= self.COMMAND_QUEUE_MAX:
+            logger.warning(
+                "Dropping MQTT command because queue is full topic=%s", message.topic
+            )
+            return
+        self._commands.append((message.topic, payload))
+        self._scheduler.schedule(TASK_MQTT_COMMANDS, 0.0)
+        logger.debug("MQTT command queued topic=%s", message.topic)
+
+    def _drain_commands(self):
+        """Handle queued MQTT commands on the service loop thread."""
+
+        while self._commands:
+            topic, payload = self._commands.popleft()
+            self._handle_command(topic, payload)
+
+    def _handle_command(self, topic: str, payload: str):
+        """Handle one Home Assistant command topic."""
+
         logger.debug("MQTT command received topic=%s", topic)
         if topic == f"{self.base_topic}/time_sync/set":
             self.inverter.sync_time()
@@ -1741,15 +1765,7 @@ class GrowattMqttService:
         suffix = "/set"
         if not topic.startswith(prefix) or not topic.endswith(suffix):
             return
-        key_slug = topic[len(prefix) : -len(suffix)]
-        key = next(
-            (
-                name
-                for name in HOLDING_AND_WRITE_REGISTERS
-                if self._slug(name) == key_slug
-            ),
-            None,
-        )
+        key = self._slug_to_config_key.get(topic[len(prefix) : -len(suffix)])
         if key is None:
             logger.warning(
                 "Ignoring MQTT command for unknown config key topic=%s", topic
