@@ -126,13 +126,14 @@ class FakeSerialClient:
         return WriteResponse(start, len(values))
 
 
-class FakeGrowattClient:  # pylint: disable=too-few-public-methods
+class FakeGrowattClient:
     """Small fake for exercising inverter scheduling without serial hardware."""
 
     def __init__(self):
         self.writes = []
         self.deferred = []
         self.ready_waits = 0
+        self.fail_reads = False
 
     def write_registers(self, start, values):
         """Record a Modbus write."""
@@ -148,6 +149,13 @@ class FakeGrowattClient:  # pylint: disable=too-few-public-methods
         """Record readiness waits."""
 
         self.ready_waits += 1
+
+    def read_input_registers(self, _start, count):
+        """Return zeroed registers or simulate a failed window read."""
+
+        if self.fail_reads:
+            raise ModbusException("simulated read failure")
+        return [0] * count
 
 
 class FakeMqttClient:  # pylint: disable=too-many-instance-attributes
@@ -259,9 +267,12 @@ def make_mqtt_config(**overrides):
 def make_mqtt_service(inverter=None, scheduler=None, **config_overrides):
     """Build a GrowattMqttService wired to fakes for tests."""
 
+    if inverter is None:
+        inverter = Mock()
+        inverter.consecutive_read_failures = 0
     with patch("growatt.mqtt.Client", FakeMqttClient):
         return GrowattMqttService(
-            inverter if inverter is not None else Mock(),
+            inverter,
             make_mqtt_config(**config_overrides),
             scheduler if scheduler is not None else Scheduler(clock=FakeClock()),
         )
@@ -544,6 +555,7 @@ class GrowattRecoveryTest(unittest.TestCase):  # pylint: disable=too-many-public
         """Commands must be queued by paho callbacks and run by the scheduler."""
 
         inverter = Mock()
+        inverter.consecutive_read_failures = 0
         scheduler = Scheduler(clock=FakeClock())
         service = make_mqtt_service(inverter=inverter, scheduler=scheduler)
 
@@ -561,6 +573,7 @@ class GrowattRecoveryTest(unittest.TestCase):  # pylint: disable=too-many-public
         """The HA sync-time button must trigger sync on the loop thread."""
 
         inverter = Mock()
+        inverter.consecutive_read_failures = 0
         scheduler = Scheduler(clock=FakeClock())
         service = make_mqtt_service(inverter=inverter, scheduler=scheduler)
 
@@ -703,10 +716,29 @@ class GrowattRecoveryTest(unittest.TestCase):  # pylint: disable=too-many-public
         self.assertEqual(fake.ready_waits, 1)
         self.assertEqual(scheduler.next_timeout(), 720.0)
 
+    def test_inverter_tracks_consecutive_read_failures(self):
+        """Failed status reads should count up; a success should reset."""
+
+        scheduler = Scheduler(clock=FakeClock())
+        inverter = GrowattInverter(make_modbus_config(), scheduler)
+        fake = FakeGrowattClient()
+        inverter.client = fake
+
+        fake.fail_reads = True
+        for expected in (1, 2):
+            with self.assertRaises(ModbusException):
+                inverter.read_status()
+            self.assertEqual(inverter.consecutive_read_failures, expected)
+
+        fake.fail_reads = False
+        inverter.read_status()
+        self.assertEqual(inverter.consecutive_read_failures, 0)
+
     def test_mqtt_publishes_skip_while_disconnected(self):
         """Armed publish tasks must be no-ops while the broker is down."""
 
         inverter = Mock()
+        inverter.consecutive_read_failures = 0
         scheduler = Scheduler(clock=FakeClock())
         service = make_mqtt_service(inverter=inverter, scheduler=scheduler)
         scheduler.schedule(TASK_MQTT_STATUS, 0.0)
@@ -722,6 +754,7 @@ class GrowattRecoveryTest(unittest.TestCase):  # pylint: disable=too-many-public
         """Config readback keeps priority over the 1 s status poll."""
 
         inverter = Mock()
+        inverter.consecutive_read_failures = 0
         inverter.read_status.return_value = {"SystemStatus": "Standby"}
         inverter.read_config.return_value = {"OutputConfig": "SBU"}
         scheduler = Scheduler(clock=FakeClock())
@@ -733,7 +766,9 @@ class GrowattRecoveryTest(unittest.TestCase):  # pylint: disable=too-many-public
         scheduler.run_pending()
 
         topics = [
-            topic for topic, _payload, _retain in fake_mqtt_client(service).published
+            topic
+            for topic, _payload, _retain in fake_mqtt_client(service).published
+            if topic != "growatt/spf5000es/inverter/availability"
         ]
         self.assertEqual(
             topics,
@@ -747,6 +782,7 @@ class GrowattRecoveryTest(unittest.TestCase):  # pylint: disable=too-many-public
         """A successful status publish should re-arm one second out."""
 
         inverter = Mock()
+        inverter.consecutive_read_failures = 0
         inverter.read_status.return_value = {"SystemStatus": "Standby"}
         scheduler = Scheduler(clock=FakeClock())
         service = make_mqtt_service(inverter=inverter, scheduler=scheduler)
@@ -756,6 +792,58 @@ class GrowattRecoveryTest(unittest.TestCase):  # pylint: disable=too-many-public
         scheduler.run_pending()
 
         self.assertEqual(scheduler.next_timeout(), 1.0)
+
+    def test_read_failures_toggle_inverter_availability(self):
+        """Three failed reads mark the inverter offline; recovery flips it back."""
+
+        inverter = Mock()
+        inverter.consecutive_read_failures = 0
+        inverter.read_status.side_effect = ModbusException("boom")
+        scheduler = Scheduler(clock=FakeClock())
+        service = make_mqtt_service(inverter=inverter, scheduler=scheduler)
+        service._connected = True  # pylint: disable=protected-access
+
+        service.publish_status()
+        inverter.consecutive_read_failures = 3
+        service.publish_status()
+
+        inverter.read_status.side_effect = None
+        inverter.read_status.return_value = {"SystemStatus": "Standby"}
+        inverter.consecutive_read_failures = 0
+        service.publish_status()
+
+        topic = "growatt/spf5000es/inverter/availability"
+        availability = [
+            item for item in fake_mqtt_client(service).published if item[0] == topic
+        ]
+        self.assertEqual(
+            availability,
+            [(topic, "online", True), (topic, "offline", True), (topic, "online", True)],
+        )
+
+    def test_discovery_entities_require_broker_and_inverter_availability(self):
+        """Entities must go unavailable when either link is down."""
+
+        service = make_mqtt_service()
+        client = fake_mqtt_client(service)
+        service._on_connect(client, None, None, 0)  # pylint: disable=protected-access
+
+        messages = {topic: payload for topic, payload, _retain in client.published}
+        topic = (
+            "homeassistant/sensor/growatt_spf5000es/"
+            "growatt_spf5000es_battery_soc/config"
+        )
+        payload = json.loads(messages[topic])
+
+        self.assertEqual(payload["availability_mode"], "all")
+        self.assertEqual(
+            payload["availability"],
+            [
+                {"topic": "growatt/spf5000es/availability"},
+                {"topic": "growatt/spf5000es/inverter/availability"},
+            ],
+        )
+        self.assertNotIn("availability_topic", payload)
 
 
 class SchedulerTest(unittest.TestCase):

@@ -1007,6 +1007,7 @@ class GrowattInverter:  # pylint: disable=too-many-instance-attributes
         self._write_queue_size = max(1, config.write_queue_size)
         self._scheduler = scheduler
         self._lock = RLock()
+        self._consecutive_read_failures = 0
         scheduler.register(TASK_WRITE_FLUSH, self.flush_pending_writes, priority=10)
         scheduler.register(TASK_TIME_SYNC, self.sync_time, priority=90)
         logger.info(
@@ -1180,6 +1181,26 @@ class GrowattInverter:  # pylint: disable=too-many-instance-attributes
 
         return registers
 
+    def _tracked_read(
+        self, reader: Callable[[int, int], List[int]], windows: List[tuple[int, int]]
+    ) -> List[int]:
+        """Read windows while tracking consecutive full-read failures."""
+
+        try:
+            registers = self._read_register_windows(reader, windows)
+        except Exception:  # pylint: disable=broad-except
+            self._consecutive_read_failures += 1
+            raise
+        self._consecutive_read_failures = 0
+        return registers
+
+    @property
+    def consecutive_read_failures(self) -> int:
+        """Number of consecutive failed status/config register reads."""
+
+        with self._lock:
+            return self._consecutive_read_failures
+
     @staticmethod
     def registers_to_bytes(
         registers: List[int], start: int = 0, length: int = 1
@@ -1279,7 +1300,7 @@ class GrowattInverter:  # pylint: disable=too-many-instance-attributes
         """Read the system status and other information from the inverter."""
         with self._lock:
             logger.debug("Reading inverter status")
-            reg = self._read_register_windows(
+            reg = self._tracked_read(
                 self.client.read_input_registers, INPUT_REGISTER_WINDOWS
             )
             info = {}
@@ -1297,7 +1318,7 @@ class GrowattInverter:  # pylint: disable=too-many-instance-attributes
         """Read the system configuration from the inverter."""
         with self._lock:
             logger.debug("Reading inverter config")
-            reg = self._read_register_windows(
+            reg = self._tracked_read(
                 self.client.read_holding_registers, HOLDING_REGISTER_WINDOWS
             )
             info = {}
@@ -1405,11 +1426,12 @@ class GrowattMqttConfig:  # pylint: disable=too-many-instance-attributes
         self.discovery_prefix = self.discovery_prefix.strip("/") or "homeassistant"
 
 
-class GrowattMqttService:
+class GrowattMqttService:  # pylint: disable=too-many-instance-attributes
     """Publish inverter state and accept config writes over MQTT."""
 
     STATUS_INTERVAL_SEC = 1.0
     COMMAND_QUEUE_MAX = 32
+    INVERTER_OFFLINE_AFTER_FAILURES = 3
 
     def __init__(
         self,
@@ -1428,6 +1450,7 @@ class GrowattMqttService:
         self._scheduler = scheduler
         self._client = self._make_client()
         self._connected = False
+        self._inverter_available: Optional[bool] = None
         self._commands: deque[tuple[str, str]] = deque()
         self._slug_to_config_key = {
             self._slug(name): name for name in HOLDING_AND_WRITE_REGISTERS
@@ -1457,6 +1480,12 @@ class GrowattMqttService:
         """Return the MQTT availability topic."""
 
         return f"{self.base_topic}/availability"
+
+    @property
+    def inverter_availability_topic(self) -> str:
+        """Return the inverter-health availability topic."""
+
+        return f"{self.base_topic}/inverter/availability"
 
     @staticmethod
     def _is_word_boundary(
@@ -1716,6 +1745,8 @@ class GrowattMqttService:
         logger.info("MQTT connected")
         self._connected = True
         client.publish(self.availability_topic, "online", retain=True)
+        self._inverter_available = None
+        self._publish_inverter_availability()
         client.subscribe(f"{self.base_topic}/config/+/set")
         client.subscribe(f"{self.base_topic}/time_sync/set")
         self._publish_discovery()
@@ -1823,7 +1854,11 @@ class GrowattMqttService:
             "name": name,
             "object_id": object_id,
             "unique_id": f"{self.config.device_id}_{object_id}",
-            "availability_topic": self.availability_topic,
+            "availability": [
+                {"topic": self.availability_topic},
+                {"topic": self.inverter_availability_topic},
+            ],
+            "availability_mode": "all",
             "device": self._device_payload(),
         }
 
@@ -1938,6 +1973,20 @@ class GrowattMqttService:
         )
         self._client.publish(topic, "", retain=True)
 
+    def _publish_inverter_availability(self):
+        """Publish inverter availability whenever its health state changes."""
+
+        available = (
+            self.inverter.consecutive_read_failures
+            < self.INVERTER_OFFLINE_AFTER_FAILURES
+        )
+        if available == self._inverter_available:
+            return
+        self._inverter_available = available
+        payload = "online" if available else "offline"
+        logger.info("Inverter availability changed state=%s", payload)
+        self._client.publish(self.inverter_availability_topic, payload, retain=True)
+
     def publish_status(self):
         """Read and publish status registers."""
 
@@ -1947,7 +1996,9 @@ class GrowattMqttService:
             status = self.inverter.read_status()
         except ModbusException as exc:
             logger.error("MQTT status publish failed: %s", exc)
+            self._publish_inverter_availability()
             return
+        self._publish_inverter_availability()
         for key, value in status.items():
             self._client.publish(
                 self._value_topic(self.base_topic, "status", key),
@@ -1965,7 +2016,9 @@ class GrowattMqttService:
             config = self.inverter.read_config()
         except ModbusException as exc:
             logger.error("MQTT config publish failed: %s", exc)
+            self._publish_inverter_availability()
             return
+        self._publish_inverter_availability()
         for key, value in config.items():
             self._client.publish(
                 self._value_topic(self.base_topic, "config", key),
