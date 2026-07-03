@@ -977,6 +977,43 @@ class SchedulerTest(unittest.TestCase):
         scheduler.wait(5.0)
         self.assertLess(real_clock() - started, 1.0)
 
+    def test_status_poll_backs_off_while_inverter_unreachable(self):
+        """Consecutive read failures should stretch the poll interval to 30 s."""
+
+        inverter = Mock()
+        inverter.consecutive_read_failures = 0
+        inverter.read_status.side_effect = ModbusException("boom")
+        clock = FakeClock()
+        scheduler = Scheduler(clock=clock)
+        service = make_mqtt_service(inverter=inverter, scheduler=scheduler)
+        service._connected = True  # pylint: disable=protected-access
+
+        scheduler.schedule(TASK_MQTT_STATUS, 0.0)
+        for expected in (2.0, 4.0, 8.0, 16.0, 30.0, 30.0):
+            scheduler.run_pending()
+            self.assertEqual(scheduler.next_timeout(), expected)
+            clock.advance(expected)
+
+        inverter.read_status.side_effect = None
+        inverter.read_status.return_value = {"SystemStatus": "Standby"}
+        scheduler.run_pending()
+        self.assertEqual(scheduler.next_timeout(), 1.0)
+
+    def test_config_publish_retries_soon_after_failure(self):
+        """A failed config read must not wait out the 5+ minute interval."""
+
+        inverter = Mock()
+        inverter.consecutive_read_failures = 0
+        inverter.read_config.side_effect = ModbusException("boom")
+        scheduler = Scheduler(clock=FakeClock())
+        service = make_mqtt_service(inverter=inverter, scheduler=scheduler)
+        service._connected = True  # pylint: disable=protected-access
+
+        scheduler.schedule(TASK_MQTT_CONFIG, 0.0)
+        scheduler.run_pending()
+
+        self.assertEqual(scheduler.next_timeout(), 30.0)
+
 
 if __name__ == "__main__":
     unittest.main()

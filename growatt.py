@@ -1430,6 +1430,8 @@ class GrowattMqttService:  # pylint: disable=too-many-instance-attributes
     """Publish inverter state and accept config writes over MQTT."""
 
     STATUS_INTERVAL_SEC = 1.0
+    STATUS_FAILURE_BACKOFF_MAX_SEC = 30.0
+    CONFIG_FAILURE_RETRY_SEC = 30.0
     COMMAND_QUEUE_MAX = 32
     INVERTER_OFFLINE_AFTER_FAILURES = 3
 
@@ -1451,6 +1453,7 @@ class GrowattMqttService:  # pylint: disable=too-many-instance-attributes
         self._client = self._make_client()
         self._connected = False
         self._inverter_available: Optional[bool] = None
+        self._status_retry_delay_sec = self.STATUS_INTERVAL_SEC
         self._commands: deque[tuple[str, str]] = deque()
         self._slug_to_config_key = {
             self._slug(name): name for name in HOLDING_AND_WRITE_REGISTERS
@@ -1988,7 +1991,7 @@ class GrowattMqttService:  # pylint: disable=too-many-instance-attributes
         self._client.publish(self.inverter_availability_topic, payload, retain=True)
 
     def publish_status(self):
-        """Read and publish status registers."""
+        """Read and publish status registers, backing off while reads fail."""
 
         if not self._connected:
             return
@@ -1997,7 +2000,12 @@ class GrowattMqttService:  # pylint: disable=too-many-instance-attributes
         except ModbusException as exc:
             logger.error("MQTT status publish failed: %s", exc)
             self._publish_inverter_availability()
+            self._status_retry_delay_sec = min(
+                self.STATUS_FAILURE_BACKOFF_MAX_SEC, self._status_retry_delay_sec * 2
+            )
+            self._scheduler.schedule(TASK_MQTT_STATUS, self._status_retry_delay_sec)
             return
+        self._status_retry_delay_sec = self.STATUS_INTERVAL_SEC
         self._publish_inverter_availability()
         for key, value in status.items():
             self._client.publish(
@@ -2017,6 +2025,7 @@ class GrowattMqttService:  # pylint: disable=too-many-instance-attributes
         except ModbusException as exc:
             logger.error("MQTT config publish failed: %s", exc)
             self._publish_inverter_availability()
+            self._scheduler.schedule(TASK_MQTT_CONFIG, self.CONFIG_FAILURE_RETRY_SEC)
             return
         self._publish_inverter_availability()
         for key, value in config.items():
