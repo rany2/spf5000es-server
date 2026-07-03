@@ -833,6 +833,29 @@ class GrowattRecoveryTest(unittest.TestCase):  # pylint: disable=too-many-public
             [(topic, "online", True), (topic, "offline", True), (topic, "online", True)],
         )
 
+    def test_on_connect_does_not_touch_inverter_lock(self):
+        """The paho thread must not read inverter state that needs its I/O lock."""
+
+        class _LockGuardedInverter:  # pylint: disable=too-few-public-methods
+            """Stand-in inverter whose guarded property must never be read here."""
+
+            @property
+            def consecutive_read_failures(self):
+                """Fail the test if the paho thread reads this lock-guarded value."""
+
+                raise AssertionError(
+                    "_on_connect must not access consecutive_read_failures"
+                )
+
+        service = make_mqtt_service(inverter=_LockGuardedInverter())
+        client = fake_mqtt_client(service)
+
+        service._on_connect(client, None, None, 0)  # pylint: disable=protected-access
+
+        topic = "growatt/spf5000es/inverter/availability"
+        availability = [item for item in client.published if item[0] == topic]
+        self.assertEqual(availability, [])
+
     def test_discovery_entities_require_broker_and_inverter_availability(self):
         """Entities must go unavailable when either link is down."""
 

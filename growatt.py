@@ -1754,8 +1754,11 @@ class GrowattMqttService:  # pylint: disable=too-many-instance-attributes
         logger.info("MQTT connected")
         self._connected = True
         client.publish(self.availability_topic, "online", retain=True)
+        # Reset (not publish) inverter availability: this callback runs on the
+        # paho network thread and must never take the inverter I/O lock, which
+        # reading consecutive_read_failures would do. The scheduled status/config
+        # tasks below republish it from the loop thread on their first run.
         self._inverter_available = None
-        self._publish_inverter_availability()
         client.subscribe(f"{self.base_topic}/config/+/set")
         client.subscribe(f"{self.base_topic}/time_sync/set")
         self._publish_discovery()
