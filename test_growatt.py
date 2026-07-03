@@ -20,6 +20,7 @@ from growatt import (
     GrowattMqttService,
     GrowattModbusClient,
     ModbusAppConfig,
+    Scheduler,
     WriteQueueFullError,
     read_app_config,
 )
@@ -38,6 +39,21 @@ def make_modbus_config(**overrides):
     }
     config.update(overrides)
     return ModbusAppConfig(**config)
+
+
+class FakeClock:
+    """Deterministic monotonic clock for scheduler tests."""
+
+    def __init__(self, now=0.0):
+        self.now = now
+
+    def __call__(self):
+        return self.now
+
+    def advance(self, sec):
+        """Move the clock forward."""
+
+        self.now += sec
 
 
 class ReadResponse:  # pylint: disable=too-few-public-methods
@@ -678,6 +694,138 @@ class GrowattRecoveryTest(unittest.TestCase):  # pylint: disable=too-many-public
         self.assertEqual(fake.ready_waits, 1)
         sleep_mock.assert_called_once_with(0.8)
         self.assertEqual(fake.writes, [(45, [2026, 5, 17, 12, 34, 57])])
+
+
+class SchedulerTest(unittest.TestCase):
+    """Tests for the cooperative deadline scheduler."""
+
+    def test_registered_task_stays_idle_until_scheduled(self):
+        """register() must not arm a task; schedule() must."""
+
+        clock = FakeClock()
+        scheduler = Scheduler(clock=clock)
+        runs = []
+        scheduler.register("task", lambda: runs.append("task"))
+
+        scheduler.run_pending()
+        self.assertEqual(runs, [])
+        self.assertIsNone(scheduler.next_timeout())
+
+        scheduler.schedule("task", 5.0)
+        self.assertEqual(scheduler.next_timeout(), 5.0)
+        scheduler.run_pending()
+        self.assertEqual(runs, [])
+
+        clock.advance(5.0)
+        scheduler.run_pending()
+        self.assertEqual(runs, ["task"])
+        self.assertIsNone(scheduler.next_timeout())
+
+    def test_due_tasks_run_in_priority_order(self):
+        """When several tasks are due, lower priority number runs first."""
+
+        clock = FakeClock()
+        scheduler = Scheduler(clock=clock)
+        runs = []
+        scheduler.register("late", lambda: runs.append("late"), priority=50)
+        scheduler.register("early", lambda: runs.append("early"), priority=10)
+        scheduler.schedule("late", 0.0)
+        scheduler.schedule("early", 0.0)
+
+        scheduler.run_pending()
+
+        self.assertEqual(runs, ["early", "late"])
+
+    def test_schedule_without_replace_keeps_existing_deadline(self):
+        """replace=False must not push back an already-armed task."""
+
+        clock = FakeClock()
+        scheduler = Scheduler(clock=clock)
+        scheduler.register("task", lambda: None)
+
+        scheduler.schedule("task", 1.0)
+        scheduler.schedule("task", 60.0, replace=False)
+        self.assertEqual(scheduler.next_timeout(), 1.0)
+
+        scheduler.schedule("task", 60.0)
+        self.assertEqual(scheduler.next_timeout(), 60.0)
+
+    def test_periodic_task_reschedules_after_run(self):
+        """Tasks with an interval re-arm themselves after each run."""
+
+        clock = FakeClock()
+        scheduler = Scheduler(clock=clock)
+        runs = []
+        scheduler.register("task", lambda: runs.append("run"), interval_sec=10.0)
+        scheduler.schedule("task", 0.0)
+
+        scheduler.run_pending()
+
+        self.assertEqual(runs, ["run"])
+        self.assertEqual(scheduler.next_timeout(), 10.0)
+
+    def test_failing_periodic_task_is_logged_and_rescheduled(self):
+        """A raising callback must not kill the loop or drop the task."""
+
+        clock = FakeClock()
+        scheduler = Scheduler(clock=clock)
+
+        def boom():
+            raise RuntimeError("boom")
+
+        scheduler.register("task", boom, interval_sec=10.0)
+        scheduler.schedule("task", 0.0)
+
+        with self.assertLogs("growatt", level="ERROR"):
+            scheduler.run_pending()
+
+        self.assertEqual(scheduler.next_timeout(), 10.0)
+
+    def test_callback_reschedule_overrides_interval(self):
+        """A callback that reschedules itself wins over the default interval."""
+
+        clock = FakeClock()
+        scheduler = Scheduler(clock=clock)
+        scheduler.register(
+            "task", lambda: scheduler.schedule("task", 3.0), interval_sec=10.0
+        )
+        scheduler.schedule("task", 0.0)
+
+        scheduler.run_pending()
+
+        self.assertEqual(scheduler.next_timeout(), 3.0)
+
+    def test_cancel_disarms_task(self):
+        """cancel() must clear an armed deadline."""
+
+        clock = FakeClock()
+        scheduler = Scheduler(clock=clock)
+        scheduler.register("task", lambda: None)
+        scheduler.schedule("task", 1.0)
+
+        scheduler.cancel("task")
+
+        self.assertIsNone(scheduler.next_timeout())
+
+    def test_schedule_unknown_task_raises(self):
+        """Arming an unregistered task is a programming error."""
+
+        scheduler = Scheduler(clock=FakeClock())
+        with self.assertRaises(KeyError):
+            scheduler.schedule("nope")
+
+    def test_schedule_wakes_waiting_loop(self):
+        """schedule() must interrupt wait() so cross-thread work runs promptly."""
+
+        from time import perf_counter as real_clock  # pylint: disable=import-outside-toplevel
+
+        scheduler = Scheduler()
+        scheduler.register("task", lambda: None)
+        scheduler.schedule("task", 30.0)
+
+        started = real_clock()
+        scheduler.wait(5.0)
+        self.assertLess(real_clock() - started, 1.0)
 
 
 if __name__ == "__main__":

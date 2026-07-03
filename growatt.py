@@ -13,7 +13,7 @@ from datetime import datetime
 from enum import Enum
 from json import dumps as json_dumps
 from json import loads as json_loads
-from threading import RLock
+from threading import Event, RLock
 from time import perf_counter, sleep
 from typing import Any, Callable, Dict, List, Optional, Union
 
@@ -460,6 +460,168 @@ CONFIG_NUMBER_LIMITS = {
 
 class WriteQueueFullError(RuntimeError):
     """Raised when the pending Modbus write queue is full."""
+
+
+TASK_WRITE_FLUSH = "modbus_write_flush"
+TASK_TIME_SYNC = "inverter_time_sync"
+TASK_MQTT_COMMANDS = "mqtt_commands"
+TASK_MQTT_CONFIG = "mqtt_config_publish"
+TASK_MQTT_STATUS = "mqtt_status_publish"
+
+
+@dataclass
+class _ScheduledTask:
+    """A named callback with an optional armed deadline."""
+
+    name: str
+    callback: Callable[[], None]
+    deadline: Optional[float]
+    priority: int
+    interval_sec: Optional[float]
+
+
+class Scheduler:
+    """Cooperative deadline scheduler driving the main service loop.
+
+    Tasks are registered once by name and armed with schedule(). Callbacks
+    run on the loop thread from run_pending(); schedule() and cancel() are
+    thread-safe and wake a wait()ing loop immediately, so paho callbacks can
+    hand work to the loop without doing I/O themselves.
+    """
+
+    def __init__(self, clock: Callable[[], float] = perf_counter):
+        """Initialize scheduler with a clock function.
+
+        Args:
+            clock: Callable that returns current monotonic time in seconds.
+        """
+
+        self._clock = clock
+        self._lock = RLock()
+        self._wakeup = Event()
+        self._tasks: Dict[str, _ScheduledTask] = {}
+
+    def register(
+        self,
+        name: str,
+        callback: Callable[[], None],
+        *,
+        interval_sec: Optional[float] = None,
+        priority: int = 100,
+    ):
+        """Register a named task; it stays idle until schedule() arms it.
+
+        Args:
+            name: Unique task name.
+            callback: Function to invoke when the task runs.
+            interval_sec: If set, task re-arms itself after running.
+            priority: Lower numbers run first when multiple tasks are due.
+        """
+
+        with self._lock:
+            if name in self._tasks:
+                raise ValueError(f"Task {name!r} already registered")
+            self._tasks[name] = _ScheduledTask(
+                name=name,
+                callback=callback,
+                deadline=None,
+                priority=priority,
+                interval_sec=interval_sec,
+            )
+
+    def schedule(self, name: str, delay_sec: float = 0.0, replace: bool = True):
+        """Arm a registered task to run after delay_sec.
+
+        With replace=False an already-armed deadline is kept, which lets
+        callers implement "start a batch window only if none is pending".
+
+        Args:
+            name: Task name to arm.
+            delay_sec: Seconds until the task should run.
+            replace: If False, keep an existing earlier deadline.
+
+        Raises:
+            KeyError: If the task name is not registered.
+        """
+
+        with self._lock:
+            task = self._tasks[name]
+            if task.deadline is None or replace:
+                task.deadline = self._clock() + max(0.0, delay_sec)
+            self._wakeup.set()
+
+    def cancel(self, name: str):
+        """Disarm a registered task.
+
+        Args:
+            name: Task name to disarm.
+        """
+
+        with self._lock:
+            self._tasks[name].deadline = None
+
+    def next_timeout(self) -> Optional[float]:
+        """Return seconds until the earliest armed task, or None when idle.
+
+        Returns:
+            Seconds until next deadline, or None if no tasks are armed.
+        """
+
+        with self._lock:
+            deadlines = [
+                task.deadline
+                for task in self._tasks.values()
+                if task.deadline is not None
+            ]
+            if not deadlines:
+                return None
+            return max(0.0, min(deadlines) - self._clock())
+
+    def run_pending(self):
+        """Run every task due now, ordered by priority then deadline.
+
+        Raises in callbacks are logged and do not prevent other tasks from
+        running. Periodic tasks (with interval_sec) are re-armed unless the
+        callback itself called schedule().
+        """
+
+        now = self._clock()
+        with self._lock:
+            due = sorted(
+                (
+                    task
+                    for task in self._tasks.values()
+                    if task.deadline is not None and task.deadline <= now
+                ),
+                key=lambda task: (task.priority, task.deadline),
+            )
+            for task in due:
+                task.deadline = None
+        for task in due:
+            try:
+                task.callback()
+            except Exception:  # pylint: disable=broad-except
+                logger.exception("Scheduled task failed name=%s", task.name)
+            with self._lock:
+                if task.interval_sec is not None and task.deadline is None:
+                    task.deadline = self._clock() + task.interval_sec
+
+    def wait(self, max_wait_sec: float = 0.5):
+        """Sleep until the next deadline, a wakeup, or max_wait_sec.
+
+        This allows event loops to block with a deadline, while being woken
+        up by schedule() calls from other threads.
+
+        Args:
+            max_wait_sec: Maximum seconds to sleep.
+        """
+
+        timeout = self.next_timeout()
+        if timeout is None or timeout > max_wait_sec:
+            timeout = max_wait_sec
+        if timeout > 0.0:
+            self._wakeup.wait(timeout)
+        self._wakeup.clear()
 
 
 class GrowattModbusClient:  # pylint: disable=too-many-instance-attributes
