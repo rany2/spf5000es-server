@@ -15,6 +15,9 @@ from pymodbus.exceptions import ModbusException
 from growatt import (
     HOLDING_REGISTER_WINDOWS,
     INPUT_REGISTER_WINDOWS,
+    TASK_MQTT_CONFIG,
+    TASK_MQTT_STATUS,
+    TASK_TIME_SYNC,
     GrowattInverter,
     GrowattMqttConfig,
     GrowattMqttService,
@@ -242,6 +245,17 @@ def make_mqtt_config(**overrides):
     return GrowattMqttConfig(**config)
 
 
+def make_mqtt_service(inverter=None, scheduler=None, **config_overrides):
+    """Build a GrowattMqttService wired to fakes for tests."""
+
+    with patch("growatt.mqtt.Client", FakeMqttClient):
+        return GrowattMqttService(
+            inverter if inverter is not None else Mock(),
+            make_mqtt_config(**config_overrides),
+            scheduler if scheduler is not None else Scheduler(clock=FakeClock()),
+        )
+
+
 class GrowattRecoveryTest(unittest.TestCase):  # pylint: disable=too-many-public-methods
     """Regression tests for Modbus recovery paths."""
 
@@ -341,8 +355,7 @@ class GrowattRecoveryTest(unittest.TestCase):  # pylint: disable=too-many-public
     def test_mqtt_discovery_exposes_writable_selects(self):
         """Home Assistant discovery should expose enum settings as selects."""
 
-        with patch("growatt.mqtt.Client", FakeMqttClient):
-            service = GrowattMqttService(Mock(), make_mqtt_config())
+        service = make_mqtt_service()
 
         client = fake_mqtt_client(service)
         service._on_connect(client, None, None, 0)  # pylint: disable=protected-access
@@ -389,8 +402,7 @@ class GrowattRecoveryTest(unittest.TestCase):  # pylint: disable=too-many-public
     def test_mqtt_discovery_sets_sys_year_number_limits(self):
         """Clock number entities should accept real year values in Home Assistant."""
 
-        with patch("growatt.mqtt.Client", FakeMqttClient):
-            service = GrowattMqttService(Mock(), make_mqtt_config())
+        service = make_mqtt_service()
 
         client = fake_mqtt_client(service)
         service._on_connect(client, None, None, 0)  # pylint: disable=protected-access
@@ -414,8 +426,7 @@ class GrowattRecoveryTest(unittest.TestCase):  # pylint: disable=too-many-public
     def test_mqtt_discovery_sets_generic_number_limits(self):
         """Generic numeric config entities should accept full UINT register values."""
 
-        with patch("growatt.mqtt.Client", FakeMqttClient):
-            service = GrowattMqttService(Mock(), make_mqtt_config())
+        service = make_mqtt_service()
 
         client = fake_mqtt_client(service)
         service._on_connect(client, None, None, 0)  # pylint: disable=protected-access
@@ -434,8 +445,7 @@ class GrowattRecoveryTest(unittest.TestCase):  # pylint: disable=too-many-public
     def test_mqtt_discovery_exposes_read_only_boolean_as_binary_sensor(self):
         """Boolean config states should not be discovered as numeric sensors."""
 
-        with patch("growatt.mqtt.Client", FakeMqttClient):
-            service = GrowattMqttService(Mock(), make_mqtt_config())
+        service = make_mqtt_service()
 
         client = fake_mqtt_client(service)
         service._on_connect(client, None, None, 0)  # pylint: disable=protected-access
@@ -465,8 +475,7 @@ class GrowattRecoveryTest(unittest.TestCase):  # pylint: disable=too-many-public
     def test_mqtt_discovery_sets_energy_state_class_total_increasing(self):
         """Energy sensors should use a Home Assistant-compatible state class."""
 
-        with patch("growatt.mqtt.Client", FakeMqttClient):
-            service = GrowattMqttService(Mock(), make_mqtt_config())
+        service = make_mqtt_service()
 
         client = fake_mqtt_client(service)
         service._on_connect(client, None, None, 0)  # pylint: disable=protected-access
@@ -485,8 +494,7 @@ class GrowattRecoveryTest(unittest.TestCase):  # pylint: disable=too-many-public
     def test_mqtt_discovery_sets_battery_soc_as_percent(self):
         """BatterySOC should not be mistaken for a Celsius temperature sensor."""
 
-        with patch("growatt.mqtt.Client", FakeMqttClient):
-            service = GrowattMqttService(Mock(), make_mqtt_config())
+        service = make_mqtt_service()
 
         client = fake_mqtt_client(service)
         service._on_connect(client, None, None, 0)  # pylint: disable=protected-access
@@ -525,8 +533,7 @@ class GrowattRecoveryTest(unittest.TestCase):  # pylint: disable=too-many-public
         """MQTT config commands should flow through inverter write validation."""
 
         inverter = Mock()
-        with patch("growatt.mqtt.Client", FakeMqttClient):
-            service = GrowattMqttService(inverter, make_mqtt_config())
+        service = make_mqtt_service(inverter=inverter)
 
         service._on_message(  # pylint: disable=protected-access
             service._client,  # pylint: disable=protected-access
@@ -539,142 +546,26 @@ class GrowattRecoveryTest(unittest.TestCase):  # pylint: disable=too-many-public
     def test_mqtt_client_limits_offline_publish_queue(self):
         """The MQTT client should not allow a large reconnect publish burst."""
 
-        with patch("growatt.mqtt.Client", FakeMqttClient):
-            service = GrowattMqttService(Mock(), make_mqtt_config())
+        service = make_mqtt_service()
 
         self.assertEqual(fake_mqtt_client(service).max_queued_messages, 1)
-
-    def test_mqtt_maintenance_does_not_publish_while_disconnected(self):
-        """Offline maintenance should drop stale state instead of queueing it."""
-
-        inverter = Mock()
-        inverter.read_status.return_value = {"SystemStatus": "Standby"}
-        inverter.read_config.return_value = {"OutputConfig": "SBU"}
-        with patch("growatt.mqtt.Client", FakeMqttClient):
-            service = GrowattMqttService(inverter, make_mqtt_config())
-        service._discovery_published = True  # pylint: disable=protected-access
-        service._connected = False  # pylint: disable=protected-access
-        service._next_status_publish = 100.0  # pylint: disable=protected-access
-        service._next_config_publish = 100.0  # pylint: disable=protected-access
-
-        with patch("growatt.perf_counter", return_value=105.0):
-            service.run_maintenance()
-
-        inverter.read_status.assert_not_called()
-        inverter.read_config.assert_not_called()
-        self.assertEqual(fake_mqtt_client(service).published, [])
-
-    def test_mqtt_config_publish_preempts_status_within_stale_limit(self):
-        """A due config read should run before status while status is fresh enough."""
-
-        inverter = Mock()
-        inverter.read_status.return_value = {"SystemStatus": "Standby"}
-        inverter.read_config.return_value = {"OutputConfig": "SBU"}
-        with patch("growatt.mqtt.Client", FakeMqttClient):
-            service = GrowattMqttService(inverter, make_mqtt_config())
-        service._discovery_published = True  # pylint: disable=protected-access
-        service._connected = True  # pylint: disable=protected-access
-        service._next_status_publish = 100.0  # pylint: disable=protected-access
-        service._next_config_publish = 100.0  # pylint: disable=protected-access
-
-        with patch("growatt.perf_counter", return_value=105.0):
-            service.run_maintenance()
-
-        client = fake_mqtt_client(service)
-        topics = [topic for topic, _payload, _retain in client.published]
-        self.assertEqual(
-            topics,
-            [
-                "growatt/spf5000es/config/output_config/state",
-                "growatt/spf5000es/status/system_status/state",
-            ],
-        )
-
-    def test_mqtt_status_publish_preempts_config_after_stale_limit(self):
-        """Status should not remain stale beyond six seconds for a config read."""
-
-        inverter = Mock()
-        inverter.read_status.return_value = {"SystemStatus": "Standby"}
-        inverter.read_config.return_value = {"OutputConfig": "SBU"}
-        with patch("growatt.mqtt.Client", FakeMqttClient):
-            service = GrowattMqttService(inverter, make_mqtt_config())
-        service._discovery_published = True  # pylint: disable=protected-access
-        service._connected = True  # pylint: disable=protected-access
-        service._next_status_publish = 100.0  # pylint: disable=protected-access
-        service._next_config_publish = 100.0  # pylint: disable=protected-access
-
-        with patch("growatt.perf_counter", return_value=106.0):
-            service.run_maintenance()
-
-        client = fake_mqtt_client(service)
-        topics = [topic for topic, _payload, _retain in client.published]
-        self.assertEqual(
-            topics,
-            [
-                "growatt/spf5000es/status/system_status/state",
-                "growatt/spf5000es/config/output_config/state",
-            ],
-        )
-
-    def test_mqtt_status_stale_check_uses_six_second_limit(self):
-        """The service should expose the six second status deferral limit."""
-
-        inverter = Mock()
-        with patch("growatt.mqtt.Client", FakeMqttClient):
-            service = GrowattMqttService(inverter, make_mqtt_config())
-        service._discovery_published = True  # pylint: disable=protected-access
-        service._connected = True  # pylint: disable=protected-access
-        service._next_status_publish = 100.0  # pylint: disable=protected-access
-
-        with patch("growatt.perf_counter", return_value=105.999):
-            self.assertFalse(service.is_status_publish_stale())
-        with patch("growatt.perf_counter", return_value=106.0):
-            self.assertTrue(service.is_status_publish_stale())
-
-    def test_run_maintenance_flushes_queued_writes(self):
-        """Queued writes should flush from the maintenance hook."""
-
-        inverter = GrowattInverter(make_modbus_config(write_batch_delay_sec=60))
-        fake = FakeGrowattClient()
-        inverter.client = fake
-
-        inverter.write_config("MaxChargeAmps", 30)
-        inverter._next_write_flush = 0  # pylint: disable=protected-access
-        inverter.run_maintenance()
-
-        self.assertEqual(fake.writes, [(34, [30])])
-        self.assertEqual(fake.deferred, [0.85])
 
     def test_write_queue_size_is_enforced_without_queue_thread(self):
         """The event-loop write queue should still apply backpressure."""
 
         inverter = GrowattInverter(
-            make_modbus_config(write_queue_size=1, write_batch_delay_sec=60)
+            make_modbus_config(write_queue_size=1, write_batch_delay_sec=60),
+            Scheduler(clock=FakeClock()),
         )
 
         inverter.write_config("MaxChargeAmps", 30)
         with self.assertRaises(WriteQueueFullError):
             inverter.write_config("ACChargeAmps", 20)
 
-    def test_run_maintenance_syncs_time_when_due(self):
-        """Due clock sync writes should run from the maintenance hook."""
-
-        inverter = GrowattInverter(make_modbus_config())
-        fake = FakeGrowattClient()
-        inverter.client = fake
-        inverter._next_sync_time = 0  # pylint: disable=protected-access
-
-        with patch("growatt.datetime") as datetime_mock:
-            datetime_mock.now.return_value = datetime(2026, 5, 17, 12, 34, 56)
-            inverter.run_maintenance()
-
-        self.assertEqual(fake.writes, [(45, [2026, 5, 17, 12, 34, 56])])
-        self.assertEqual(fake.ready_waits, 1)
-
     def test_sync_time_waits_for_config_settle_before_second_boundary(self):
         """Clock sync should settle first, then choose the exact second to write."""
 
-        inverter = GrowattInverter(make_modbus_config())
+        inverter = GrowattInverter(make_modbus_config(), Scheduler(clock=FakeClock()))
         fake = FakeGrowattClient()
         inverter.client = fake
 
@@ -694,6 +585,120 @@ class GrowattRecoveryTest(unittest.TestCase):  # pylint: disable=too-many-public
         self.assertEqual(fake.ready_waits, 1)
         sleep_mock.assert_called_once_with(0.8)
         self.assertEqual(fake.writes, [(45, [2026, 5, 17, 12, 34, 57])])
+
+    def test_queued_write_flushes_when_due(self):
+        """Queued writes should flush once the batch window elapses."""
+
+        clock = FakeClock()
+        scheduler = Scheduler(clock=clock)
+        inverter = GrowattInverter(
+            make_modbus_config(write_batch_delay_sec=60), scheduler
+        )
+        fake = FakeGrowattClient()
+        inverter.client = fake
+
+        inverter.write_config("MaxChargeAmps", 30)
+        scheduler.run_pending()
+        self.assertEqual(fake.writes, [])
+
+        clock.advance(60.0)
+        scheduler.run_pending()
+        self.assertEqual(fake.writes, [(34, [30])])
+        self.assertEqual(fake.deferred, [0.85])
+
+    def test_new_writes_do_not_delay_a_pending_flush(self):
+        """A second queued write must not push back the armed flush deadline."""
+
+        clock = FakeClock()
+        scheduler = Scheduler(clock=clock)
+        inverter = GrowattInverter(
+            make_modbus_config(write_batch_delay_sec=60), scheduler
+        )
+        fake = FakeGrowattClient()
+        inverter.client = fake
+
+        inverter.write_config("MaxChargeAmps", 30)
+        clock.advance(30.0)
+        inverter.write_config("ACChargeAmps", 20)
+        clock.advance(30.0)
+        scheduler.run_pending()
+
+        self.assertEqual(fake.writes, [(34, [30]), (38, [20])])
+
+    def test_time_sync_runs_when_due_and_reschedules(self):
+        """The scheduled time sync should write the clock and re-arm itself."""
+
+        clock = FakeClock()
+        scheduler = Scheduler(clock=clock)
+        inverter = GrowattInverter(make_modbus_config(), scheduler)
+        fake = FakeGrowattClient()
+        inverter.client = fake
+
+        scheduler.schedule(TASK_TIME_SYNC, 0.0)
+        with (
+            patch("growatt.sleep"),
+            patch("growatt.datetime") as datetime_mock,
+        ):
+            datetime_mock.now.return_value = datetime(2026, 5, 17, 12, 34, 56)
+            scheduler.run_pending()
+
+        self.assertEqual(fake.writes, [(45, [2026, 5, 17, 12, 34, 56])])
+        self.assertEqual(fake.ready_waits, 1)
+        self.assertEqual(scheduler.next_timeout(), 720.0)
+
+    def test_mqtt_publishes_skip_while_disconnected(self):
+        """Armed publish tasks must be no-ops while the broker is down."""
+
+        inverter = Mock()
+        scheduler = Scheduler(clock=FakeClock())
+        service = make_mqtt_service(inverter=inverter, scheduler=scheduler)
+        scheduler.schedule(TASK_MQTT_STATUS, 0.0)
+        scheduler.schedule(TASK_MQTT_CONFIG, 0.0)
+
+        scheduler.run_pending()
+
+        inverter.read_status.assert_not_called()
+        inverter.read_config.assert_not_called()
+        self.assertEqual(fake_mqtt_client(service).published, [])
+
+    def test_config_publish_runs_before_status_when_both_due(self):
+        """Config readback keeps priority over the 1 s status poll."""
+
+        inverter = Mock()
+        inverter.read_status.return_value = {"SystemStatus": "Standby"}
+        inverter.read_config.return_value = {"OutputConfig": "SBU"}
+        scheduler = Scheduler(clock=FakeClock())
+        service = make_mqtt_service(inverter=inverter, scheduler=scheduler)
+        service._connected = True  # pylint: disable=protected-access
+        scheduler.schedule(TASK_MQTT_STATUS, 0.0)
+        scheduler.schedule(TASK_MQTT_CONFIG, 0.0)
+
+        scheduler.run_pending()
+
+        topics = [
+            topic for topic, _payload, _retain in fake_mqtt_client(service).published
+        ]
+        self.assertEqual(
+            topics,
+            [
+                "growatt/spf5000es/config/output_config/state",
+                "growatt/spf5000es/status/system_status/state",
+            ],
+        )
+
+    def test_status_publish_repeats_on_interval(self):
+        """A successful status publish should re-arm one second out."""
+
+        inverter = Mock()
+        inverter.read_status.return_value = {"SystemStatus": "Standby"}
+        scheduler = Scheduler(clock=FakeClock())
+        service = make_mqtt_service(inverter=inverter, scheduler=scheduler)
+        service._connected = True  # pylint: disable=protected-access
+        scheduler.schedule(TASK_MQTT_STATUS, 0.0)
+
+        scheduler.run_pending()
+
+        self.assertEqual(scheduler.next_timeout(), 1.0)
 
 
 class SchedulerTest(unittest.TestCase):

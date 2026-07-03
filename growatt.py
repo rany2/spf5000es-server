@@ -988,12 +988,14 @@ class GrowattInverter:  # pylint: disable=too-many-instance-attributes
     """Class to interact with a Growatt inverter using Modbus RTU."""
 
     CONFIG_WRITE_SETTLE_DELAY_SEC = 0.85
+    SYNC_TIME_INTERVAL_SEC = 720.0
 
-    def __init__(self, config: ModbusAppConfig):
+    def __init__(self, config: ModbusAppConfig, scheduler: Scheduler):
         """Initialize the Growatt inverter.
 
         Args:
-            config (ModbusAppConfig): Modbus runtime configuration."""
+            config (ModbusAppConfig): Modbus runtime configuration.
+            scheduler (Scheduler): Loop scheduler for maintenance tasks."""
         self.client = GrowattModbusClient(
             config.port,
             timeout_sec=config.timeout_sec,
@@ -1003,10 +1005,10 @@ class GrowattInverter:  # pylint: disable=too-many-instance-attributes
         self.write_batch_delay_sec = max(0.0, config.write_batch_delay_sec)
         self._write_queue: deque[tuple[int, List[int]]] = deque()
         self._write_queue_size = max(1, config.write_queue_size)
-        self._next_write_flush: Optional[float] = None
-        self._sync_time_interval_sec = 720.0
-        self._next_sync_time: Optional[float] = None
+        self._scheduler = scheduler
         self._lock = RLock()
+        scheduler.register(TASK_WRITE_FLUSH, self.flush_pending_writes, priority=10)
+        scheduler.register(TASK_TIME_SYNC, self.sync_time, priority=90)
         logger.info(
             "Growatt inverter initialized write_queue_size=%s write_batch_delay_sec=%s",
             self._write_queue_size,
@@ -1017,7 +1019,7 @@ class GrowattInverter:  # pylint: disable=too-many-instance-attributes
         """Connect to the Modbus server and schedule maintenance work."""
         logger.info("Connecting inverter")
         self.client.connect()
-        self._next_sync_time = perf_counter()
+        self._scheduler.schedule(TASK_TIME_SYNC, 0.0)
         logger.info("Inverter connected; initial time sync scheduled")
 
     def close(self):
@@ -1060,10 +1062,10 @@ class GrowattInverter:  # pylint: disable=too-many-instance-attributes
                 logger.error("Failed to update time: %s", exc)
                 return None
             finally:
-                self._next_sync_time = perf_counter() + self._sync_time_interval_sec
+                self._scheduler.schedule(TASK_TIME_SYNC, self.SYNC_TIME_INTERVAL_SEC)
                 logger.info(
                     "Next inverter time sync scheduled interval_sec=%s",
-                    self._sync_time_interval_sec,
+                    self.SYNC_TIME_INTERVAL_SEC,
                 )
 
     @staticmethod
@@ -1116,7 +1118,6 @@ class GrowattInverter:  # pylint: disable=too-many-instance-attributes
 
         with self._lock:
             if not self._write_queue:
-                self._next_write_flush = None
                 logger.debug("No pending config writes to flush")
                 return
 
@@ -1124,7 +1125,6 @@ class GrowattInverter:  # pylint: disable=too-many-instance-attributes
             while self._write_queue:
                 start, values = self._write_queue.popleft()
                 requested[start] = values
-            self._next_write_flush = None
             batches = self._coalesce_writes(requested)
             failed_batches = 0
 
@@ -1163,35 +1163,6 @@ class GrowattInverter:  # pylint: disable=too-many-instance-attributes
                     len(requested),
                     len(batches),
                 )
-
-    def run_maintenance(self):
-        """Run scheduled inverter work."""
-
-        with self._lock:
-            now = perf_counter()
-            if self._next_write_flush is not None and now >= self._next_write_flush:
-                logger.debug("Maintenance flushing due config writes")
-                self.flush_pending_writes()
-            if self._next_sync_time is not None and now >= self._next_sync_time:
-                logger.debug("Maintenance syncing inverter time")
-                self.sync_time()
-
-    def next_maintenance_timeout(self) -> Optional[float]:
-        """Return seconds until the next scheduled inverter task."""
-
-        with self._lock:
-            now = perf_counter()
-            timeouts = [
-                deadline - now
-                for deadline in (self._next_write_flush, self._next_sync_time)
-                if deadline is not None
-            ]
-            if not timeouts:
-                logger.debug("No scheduled maintenance timeout")
-                return None
-            timeout = max(0.0, min(timeouts))
-            logger.debug("Next maintenance timeout timeout_sec=%s", timeout)
-            return timeout
 
     def _read_register_windows(
         self, reader: Callable[[int, int], List[int]], windows: List[tuple[int, int]]
@@ -1403,12 +1374,9 @@ class GrowattInverter:  # pylint: disable=too-many-instance-attributes
                 values,
                 len(self._write_queue),
             )
-            if self._next_write_flush is None:
-                self._next_write_flush = perf_counter() + self.write_batch_delay_sec
-                logger.debug(
-                    "Scheduled config write flush delay_sec=%s",
-                    self.write_batch_delay_sec,
-                )
+            self._scheduler.schedule(
+                TASK_WRITE_FLUSH, self.write_batch_delay_sec, replace=False
+            )
 
 
 @dataclass
@@ -1441,16 +1409,36 @@ class GrowattMqttService:
     """Publish inverter state and accept config writes over MQTT."""
 
     STATUS_INTERVAL_SEC = 1.0
-    STATUS_MAX_STALE_SEC = 6.0
 
-    def __init__(self, inverter: GrowattInverter, config: GrowattMqttConfig):
+    def __init__(
+        self,
+        inverter: GrowattInverter,
+        config: GrowattMqttConfig,
+        scheduler: Scheduler,
+    ):
+        """Initialize the MQTT service.
+
+        Args:
+            inverter (GrowattInverter): Inverter to read status/config from.
+            config (GrowattMqttConfig): MQTT and discovery runtime configuration.
+            scheduler (Scheduler): Loop scheduler for publish tasks."""
         self.inverter = inverter
         self.config = config
+        self._scheduler = scheduler
         self._client = self._make_client()
-        self._next_status_publish: Optional[float] = None
-        self._next_config_publish: Optional[float] = None
-        self._discovery_published = False
         self._connected = False
+        scheduler.register(
+            TASK_MQTT_CONFIG,
+            self.publish_config,
+            interval_sec=config.config_interval_sec,
+            priority=40,
+        )
+        scheduler.register(
+            TASK_MQTT_STATUS,
+            self.publish_status,
+            interval_sec=self.STATUS_INTERVAL_SEC,
+            priority=50,
+        )
 
     @property
     def base_topic(self) -> str:
@@ -1693,8 +1681,6 @@ class GrowattMqttService:
         )
         self._client.connect(self.config.host, self.config.port, self.config.keepalive)
         self._client.loop_start()
-        self._next_status_publish = perf_counter()
-        self._next_config_publish = perf_counter()
 
     def stop(self):
         """Publish offline availability and close the MQTT client."""
@@ -1724,9 +1710,8 @@ class GrowattMqttService:
         client.subscribe(f"{self.base_topic}/config/+/set")
         client.subscribe(f"{self.base_topic}/time_sync/set")
         self._publish_discovery()
-        self._discovery_published = True
-        self._next_status_publish = perf_counter()
-        self._next_config_publish = perf_counter()
+        self._scheduler.schedule(TASK_MQTT_CONFIG, 0.0)
+        self._scheduler.schedule(TASK_MQTT_STATUS, 0.0)
 
     def _on_disconnect(
         self,
@@ -1749,7 +1734,7 @@ class GrowattMqttService:
         logger.debug("MQTT command received topic=%s", topic)
         if topic == f"{self.base_topic}/time_sync/set":
             self.inverter.sync_time()
-            self._next_config_publish = perf_counter()
+            self._scheduler.schedule(TASK_MQTT_CONFIG, 0.0)
             return
 
         prefix = f"{self.base_topic}/config/"
@@ -1777,9 +1762,12 @@ class GrowattMqttService:
             write_delay_sec = getattr(self.inverter, "write_batch_delay_sec", 0.0)
             if not isinstance(write_delay_sec, (int, float)):
                 write_delay_sec = 0.0
-            self._next_config_publish = perf_counter() + max(
-                1.0,
-                write_delay_sec + GrowattInverter.CONFIG_WRITE_SETTLE_DELAY_SEC,
+            self._scheduler.schedule(
+                TASK_MQTT_CONFIG,
+                max(
+                    1.0,
+                    write_delay_sec + GrowattInverter.CONFIG_WRITE_SETTLE_DELAY_SEC,
+                ),
             )
             logger.info("Accepted MQTT config command key=%s", key)
         except (KeyError, ValueError, WriteQueueFullError, ModbusException) as exc:
@@ -1931,63 +1919,6 @@ class GrowattMqttService:
         )
         self._client.publish(topic, "", retain=True)
 
-    def run_maintenance(self):
-        """Publish scheduled status and config states."""
-
-        now = perf_counter()
-        if not self._discovery_published or not self._connected:
-            return
-
-        status_due = (
-            self._next_status_publish is not None and now >= self._next_status_publish
-        )
-        config_due = (
-            self._next_config_publish is not None and now >= self._next_config_publish
-        )
-        status_stale = (
-            self._next_status_publish is not None
-            and now >= self._next_status_publish + self.STATUS_MAX_STALE_SEC
-        )
-
-        if status_due and (not config_due or status_stale):
-            self.publish_status()
-            self._next_status_publish = now + self.STATUS_INTERVAL_SEC
-            status_due = False
-
-        if config_due:
-            self.publish_config()
-            self._next_config_publish = now + self.config.config_interval_sec
-
-        if status_due:
-            self.publish_status()
-            self._next_status_publish = now + self.STATUS_INTERVAL_SEC
-
-    def is_status_publish_stale(self) -> bool:
-        """Return whether status has reached its maximum allowed staleness."""
-
-        if (
-            not self._discovery_published
-            or not self._connected
-            or self._next_status_publish is None
-        ):
-            return False
-        return perf_counter() >= self._next_status_publish + self.STATUS_MAX_STALE_SEC
-
-    def next_maintenance_timeout(self) -> Optional[float]:
-        """Return seconds until the next MQTT publish is due."""
-
-        if not self._discovery_published or not self._connected:
-            return None
-        now = perf_counter()
-        deadlines = [
-            deadline - now
-            for deadline in (self._next_status_publish, self._next_config_publish)
-            if deadline is not None
-        ]
-        if not deadlines:
-            return None
-        return max(0.0, min(deadlines))
-
     def publish_status(self):
         """Read and publish status registers."""
 
@@ -2106,34 +2037,16 @@ def main():
             app_config.mqtt.topic_prefix,
             app_config.mqtt.discovery_prefix,
         )
-        inverter = GrowattInverter(app_config.modbus)
-        mqtt_service = GrowattMqttService(inverter, app_config.mqtt)
+        scheduler = Scheduler()
+        inverter = GrowattInverter(app_config.modbus, scheduler)
+        mqtt_service = GrowattMqttService(inverter, app_config.mqtt, scheduler)
         inverter.connect()
         mqtt_service.start()
 
-        def run_maintenance():
-            if mqtt_service and mqtt_service.is_status_publish_stale():
-                mqtt_service.run_maintenance()
-            inverter.run_maintenance()
-            if mqtt_service:
-                mqtt_service.run_maintenance()
-
-        def next_maintenance_timeout():
-            timeouts = [
-                timeout
-                for timeout in (
-                    inverter.next_maintenance_timeout(),
-                    mqtt_service.next_maintenance_timeout() if mqtt_service else None,
-                )
-                if timeout is not None
-            ]
-            return min(timeouts) if timeouts else None
-
-        logger.info("MQTT service loop started")
+        logger.info("Service loop started")
         while True:
-            run_maintenance()
-            timeout = next_maintenance_timeout()
-            sleep(min(0.5, timeout) if timeout is not None else 0.5)
+            scheduler.run_pending()
+            scheduler.wait()
     except KeyboardInterrupt:
         logger.info("Interrupted; shutting down")
     except Exception as exc:  # pylint: disable=broad-except
