@@ -166,6 +166,7 @@ class FakeMqttClient:  # pylint: disable=too-many-instance-attributes
         self.on_connect = None
         self.on_disconnect = None
         self.on_message = None
+        self.reconnect_delay = None
 
     def max_queued_messages_set(self, queue_size):
         """Record outgoing queue sizing."""
@@ -185,6 +186,16 @@ class FakeMqttClient:  # pylint: disable=too-many-instance-attributes
 
     def connect(self, host, port, keepalive):
         """Record a connect request."""
+
+        self.connect_args = (host, port, keepalive)
+
+    def reconnect_delay_set(self, min_delay=1, max_delay=120):
+        """Record reconnect backoff configuration."""
+
+        self.reconnect_delay = (min_delay, max_delay)
+
+    def connect_async(self, host, port, keepalive):
+        """Record an async connect request."""
 
         self.connect_args = (host, port, keepalive)
 
@@ -585,6 +596,16 @@ class GrowattRecoveryTest(unittest.TestCase):  # pylint: disable=too-many-public
         service = make_mqtt_service()
 
         self.assertEqual(fake_mqtt_client(service).max_queued_messages, 1)
+
+    def test_mqtt_start_uses_async_connect_with_reconnect_backoff(self):
+        """A down broker at startup must not crash the process."""
+
+        service = make_mqtt_service()
+        service.start()
+
+        client = fake_mqtt_client(service)
+        self.assertEqual(client.connect_args, ("mqtt.local", 1883, 60))
+        self.assertEqual(client.reconnect_delay, (1, 30))
 
     def test_write_queue_size_is_enforced_without_queue_thread(self):
         """The event-loop write queue should still apply backpressure."""

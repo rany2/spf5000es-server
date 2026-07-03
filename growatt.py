@@ -1677,7 +1677,7 @@ class GrowattMqttService:
         return client
 
     def start(self):
-        """Connect to MQTT and start the broker network loop."""
+        """Start the MQTT network loop with automatic reconnection."""
 
         logger.info(
             "Connecting MQTT broker host=%s port=%s client_id=%s",
@@ -1685,7 +1685,10 @@ class GrowattMqttService:
             self.config.port,
             self.config.client_id,
         )
-        self._client.connect(self.config.host, self.config.port, self.config.keepalive)
+        self._client.reconnect_delay_set(min_delay=1, max_delay=30)
+        self._client.connect_async(
+            self.config.host, self.config.port, self.config.keepalive
+        )
         self._client.loop_start()
 
     def stop(self):
