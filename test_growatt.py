@@ -17,6 +17,9 @@ from pymodbus.exceptions import ModbusException
 from growatt import (
     HOLDING_REGISTER_WINDOWS,
     INPUT_REGISTER_WINDOWS,
+    INPUT_REGISTERS,
+    ON_OFF_R,
+    RegType,
     TASK_MQTT_CONFIG,
     TASK_MQTT_STATUS,
     TASK_TIME_SYNC,
@@ -337,13 +340,20 @@ class GrowattRecoveryTest(unittest.TestCase):  # pylint: disable=too-many-public
             [(0, 45), (45, 45), (90, 18)],
         )
 
-    def test_unknown_register_enum_is_modbus_error(self):
-        """Unexpected device enum values should be reported as Modbus failures."""
+    def test_unknown_register_enum_is_skipped(self):
+        """One undecodable value must not abort the whole status publish."""
 
-        with self.assertRaises(ModbusException):
-            GrowattInverter._postprocess_register_value(  # pylint: disable=protected-access
-                "SystemStatus", 999, {0: "Standby"}.__getitem__
+        with self.assertLogs("growatt", level="WARNING"):
+            decoded = GrowattInverter._decode_register_table(  # pylint: disable=protected-access
+                [999], {"OnOff": (0, 1, RegType.UINT, ON_OFF_R.__getitem__, None)}
             )
+        self.assertEqual(decoded, {})
+
+    def test_unknown_system_status_falls_back_to_raw_value(self):
+        """Newer firmware status codes should still publish a readable value."""
+
+        postprocess = INPUT_REGISTERS["SystemStatus"][3]
+        self.assertEqual(postprocess(999), "Unknown (999)")
 
     def test_char_registers_tolerate_invalid_utf8(self):
         """Text-like device registers may contain arbitrary non-UTF-8 bytes."""

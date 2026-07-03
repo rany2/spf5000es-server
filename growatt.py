@@ -116,7 +116,7 @@ SYSTEM_STATUS_R = {
 }
 INPUT_REGISTERS = {
     # Register: (Start, Length, Type, PostProcess)
-    "SystemStatus": (0, 1, RegType.UINT, lambda x: SYSTEM_STATUS_R[x]),
+    "SystemStatus": (0, 1, RegType.UINT, lambda x: SYSTEM_STATUS_R.get(x, f"Unknown ({x})")),
     "PV1Volt": (1, 1, RegType.UINT, lambda x: x / 10),
     "PV2Volt": (2, 1, RegType.UINT, lambda x: x / 10),
     "PV1Watt": (3, 2, RegType.UINT, lambda x: x / 10),
@@ -1286,15 +1286,26 @@ class GrowattInverter:  # pylint: disable=too-many-instance-attributes
                 raise ValueError("Invalid register type")
 
     @staticmethod
-    def _postprocess_register_value(key: str, value: Any, postprocess: Callable):
-        """Apply a register postprocessor and normalize malformed device values."""
+    def _decode_register_table(
+        registers: List[int], table: Dict[str, tuple]
+    ) -> Dict[str, Any]:
+        """Decode a register table, skipping values the device reported malformed."""
 
-        try:
-            return postprocess(value)
-        except (KeyError, ValueError, UnicodeDecodeError) as exc:
-            raise ModbusException(
-                f"Unexpected value for register {key}: {value!r}"
-            ) from exc
+        info: Dict[str, Any] = {}
+        for key, item in table.items():
+            start, length, type_, postprocess = item[0], item[1], item[2], item[3]
+            raw_value = GrowattInverter.generic_read_postprocess(
+                registers, start, length, type_
+            )
+            try:
+                info[key] = postprocess(raw_value)
+            except (KeyError, ValueError, UnicodeDecodeError):
+                logger.warning(
+                    "Skipping register with unexpected device value key=%s value=%r",
+                    key,
+                    raw_value,
+                )
+        return info
 
     def read_status(self):
         """Read the system status and other information from the inverter."""
@@ -1303,14 +1314,7 @@ class GrowattInverter:  # pylint: disable=too-many-instance-attributes
             reg = self._tracked_read(
                 self.client.read_input_registers, INPUT_REGISTER_WINDOWS
             )
-            info = {}
-            for key, value in INPUT_REGISTERS.items():
-                start, length, type_, postprocess = value
-                raw_value = self.generic_read_postprocess(reg, start, length, type_)
-                info[key] = self._postprocess_register_value(
-                    key, raw_value, postprocess
-                )
-
+            info = self._decode_register_table(reg, INPUT_REGISTERS)
             logger.debug("Completed inverter status read fields=%s", len(info))
             return info
 
@@ -1321,14 +1325,7 @@ class GrowattInverter:  # pylint: disable=too-many-instance-attributes
             reg = self._tracked_read(
                 self.client.read_holding_registers, HOLDING_REGISTER_WINDOWS
             )
-            info = {}
-            for key, value in HOLDING_AND_WRITE_REGISTERS.items():
-                start, length, type_, readpostprocess, _ = value
-                raw_value = self.generic_read_postprocess(reg, start, length, type_)
-                info[key] = self._postprocess_register_value(
-                    key, raw_value, readpostprocess
-                )
-
+            info = self._decode_register_table(reg, HOLDING_AND_WRITE_REGISTERS)
             logger.debug("Completed inverter config read fields=%s", len(info))
             return info
 
