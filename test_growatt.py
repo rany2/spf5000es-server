@@ -2,6 +2,8 @@
 
 """Tests for Modbus validation and recovery behavior."""
 
+# pylint: disable=too-many-lines
+
 import json
 from datetime import datetime
 import tempfile
