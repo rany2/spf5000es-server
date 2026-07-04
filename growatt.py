@@ -529,6 +529,15 @@ class Scheduler:
                 interval_sec=interval_sec,
             )
 
+    def now(self) -> float:
+        """Return the scheduler's current monotonic time.
+
+        Returns:
+            Current clock reading in seconds.
+        """
+
+        return self._clock()
+
     def schedule(self, name: str, delay_sec: float = 0.0, replace: bool = True):
         """Arm a registered task to run after delay_sec.
 
@@ -984,11 +993,23 @@ class ModbusAppConfig:  # pylint: disable=too-many-instance-attributes
     reconnect_delay_sec: float
 
 
+@dataclass
+class _PendingReadback:
+    """Expected register words for a config write awaiting read-back."""
+
+    start: int
+    values: List[int]
+    verify_deadline: Optional[float]
+
+
 class GrowattInverter:  # pylint: disable=too-many-instance-attributes
     """Class to interact with a Growatt inverter using Modbus RTU."""
 
-    CONFIG_WRITE_SETTLE_DELAY_SEC = 0.85
+    # Growatt's protocol doc requires >= 850ms between commands and
+    # recommends 1s; run at the recommended value, not the bare minimum.
+    CONFIG_WRITE_SETTLE_DELAY_SEC = 1.0
     SYNC_TIME_INTERVAL_SEC = 720.0
+    READBACK_GRACE_SEC = 10.0
 
     def __init__(self, config: ModbusAppConfig, scheduler: Scheduler):
         """Initialize the Growatt inverter.
@@ -1005,6 +1026,7 @@ class GrowattInverter:  # pylint: disable=too-many-instance-attributes
         self.write_batch_delay_sec = max(0.0, config.write_batch_delay_sec)
         self._write_queue: deque[tuple[int, List[int]]] = deque()
         self._write_queue_size = max(1, config.write_queue_size)
+        self._pending_readback: Dict[str, _PendingReadback] = {}
         self._scheduler = scheduler
         self._lock = RLock()
         self._consecutive_read_failures = 0
@@ -1159,6 +1181,11 @@ class GrowattInverter:  # pylint: disable=too-many-instance-attributes
                     self.client.defer_next_operations(
                         self.CONFIG_WRITE_SETTLE_DELAY_SEC
                     )
+
+            now = self._scheduler.now()
+            for pending in self._pending_readback.values():
+                if pending.verify_deadline is None:
+                    pending.verify_deadline = now + self.READBACK_GRACE_SEC
 
             if failed_batches:
                 logger.warning(
@@ -1328,27 +1355,75 @@ class GrowattInverter:  # pylint: disable=too-many-instance-attributes
             return info
 
     def read_config(self):
-        """Read the system configuration from the inverter."""
+        """Read the system configuration from the inverter.
+
+        Keys whose recently written value is not yet visible in the read are
+        omitted so callers never observe (and republish) pre-write state."""
         with self._lock:
             logger.debug("Reading inverter config")
             reg = self._tracked_read(
                 self.client.read_holding_registers, HOLDING_REGISTER_WINDOWS
             )
             info = self._decode_register_table(reg, HOLDING_AND_WRITE_REGISTERS)
+            for key in self._reconcile_pending_readback(reg):
+                info.pop(key, None)
             logger.debug("Completed inverter config read fields=%s", len(info))
             return info
+
+    def _reconcile_pending_readback(self, registers: List[int]) -> List[str]:
+        """Check freshly read registers against pending config writes.
+
+        Args:
+            registers (List[int]): Full holding-register buffer just read.
+
+        Returns:
+            List[str]: Keys whose written value is not yet visible."""
+        now = self._scheduler.now()
+        stale: List[str] = []
+        for key, pending in list(self._pending_readback.items()):
+            window = registers[pending.start : pending.start + len(pending.values)]
+            if window == pending.values:
+                del self._pending_readback[key]
+                logger.info("Config write verified by read-back key=%s", key)
+            elif pending.verify_deadline is not None and now >= pending.verify_deadline:
+                del self._pending_readback[key]
+                logger.warning(
+                    "Config write not visible in read-back before timeout "
+                    "key=%s expected=%s read=%s",
+                    key,
+                    pending.values,
+                    window,
+                )
+            else:
+                stale.append(key)
+        return stale
+
+    @property
+    def has_pending_readback(self) -> bool:
+        """Return whether any config write still awaits read-back."""
+
+        with self._lock:
+            return bool(self._pending_readback)
 
     def write_config(self, key: str, value: Union[str, int, float]):
         """Schedule a config write for the selector-loop maintenance hook.
 
         Args:
             key (str): The configuration key to write.
-            value (Union[str, int, float]): The value to write."""
+            value (Union[str, int, float]): The value to write.
+
+        Returns:
+            The value a read-back is expected to report once the write is
+            applied, or None when it cannot be derived."""
         with self._lock:
             try:
-                start, length, type_, _, writepreprocess = HOLDING_AND_WRITE_REGISTERS[
-                    key
-                ]
+                (
+                    start,
+                    length,
+                    type_,
+                    postprocess,
+                    writepreprocess,
+                ) = HOLDING_AND_WRITE_REGISTERS[key]
             except KeyError as exc:
                 logger.warning("Rejected config write with invalid key key=%s", key)
                 raise KeyError("Invalid key") from exc
@@ -1393,6 +1468,9 @@ class GrowattInverter:  # pylint: disable=too-many-instance-attributes
                 raise WriteQueueFullError("Write queue is full")
 
             self._write_queue.append((start, values))
+            self._pending_readback[key] = _PendingReadback(
+                start=start, values=list(values), verify_deadline=None
+            )
             logger.debug(
                 "Queued config write key=%s start=%s count=%s values=%s queue_depth=%s",
                 key,
@@ -1404,6 +1482,12 @@ class GrowattInverter:  # pylint: disable=too-many-instance-attributes
             self._scheduler.schedule(
                 TASK_WRITE_FLUSH, self.write_batch_delay_sec, replace=False
             )
+            try:
+                return postprocess(
+                    self.generic_read_postprocess(values, 0, length, type_)
+                )
+            except (KeyError, ValueError, UnicodeDecodeError):
+                return None
 
 
 @dataclass
@@ -1438,6 +1522,7 @@ class GrowattMqttService:  # pylint: disable=too-many-instance-attributes
     STATUS_INTERVAL_SEC = 1.0
     STATUS_FAILURE_BACKOFF_MAX_SEC = 30.0
     CONFIG_FAILURE_RETRY_SEC = 30.0
+    CONFIG_VERIFY_RETRY_SEC = 2.0
     COMMAND_QUEUE_MAX = 32
     INVERTER_OFFLINE_AFTER_FAILURES = 3
 
@@ -1820,7 +1905,15 @@ class GrowattMqttService:  # pylint: disable=too-many-instance-attributes
 
         try:
             value = self._parse_command_payload(payload)
-            self.inverter.write_config(key, value)
+            expected = self.inverter.write_config(key, value)
+            if expected is not None:
+                # Optimistic echo: move the UI immediately; the read-back
+                # verified republish confirms (or corrects) it later.
+                self._client.publish(
+                    self._value_topic(self.base_topic, "config", key),
+                    self._mqtt_value(expected),
+                    retain=self.config.retain,
+                )
             write_delay_sec = getattr(self.inverter, "write_batch_delay_sec", 0.0)
             if not isinstance(write_delay_sec, (int, float)):
                 write_delay_sec = 0.0
@@ -2044,6 +2137,12 @@ class GrowattMqttService:  # pylint: disable=too-many-instance-attributes
                 retain=self.config.retain,
             )
         logger.debug("MQTT config published fields=%s", len(config))
+        if self.inverter.has_pending_readback:
+            # A recent write is not visible in reads yet; keep re-reading
+            # instead of waiting out the full config interval.
+            self._scheduler.schedule(
+                TASK_MQTT_CONFIG, self.CONFIG_VERIFY_RETRY_SEC, replace=False
+            )
 
 
 @dataclass

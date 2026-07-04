@@ -139,11 +139,26 @@ class FakeGrowattClient:
         self.deferred = []
         self.ready_waits = 0
         self.fail_reads = False
+        self.holding = {}
 
     def write_registers(self, start, values):
         """Record a Modbus write."""
 
         self.writes.append((start, values))
+
+    def apply_writes(self):
+        """Make recorded writes visible to holding-register reads."""
+
+        for start, values in self.writes:
+            for offset, value in enumerate(values):
+                self.holding[start + offset] = value
+
+    def read_holding_registers(self, start, count):
+        """Return holding registers from the fake device state."""
+
+        if self.fail_reads:
+            raise ModbusException("simulated read failure")
+        return [self.holding.get(start + i, 0) for i in range(count)]
 
     def defer_next_operations(self, delay_sec):
         """Record deferred Modbus timing."""
@@ -275,6 +290,7 @@ def make_mqtt_service(inverter=None, scheduler=None, **config_overrides):
     if inverter is None:
         inverter = Mock()
         inverter.consecutive_read_failures = 0
+        inverter.has_pending_readback = False
     with patch("growatt.mqtt.Client", FakeMqttClient):
         return GrowattMqttService(
             inverter,
@@ -568,6 +584,7 @@ class GrowattRecoveryTest(unittest.TestCase):  # pylint: disable=too-many-public
 
         inverter = Mock()
         inverter.consecutive_read_failures = 0
+        inverter.has_pending_readback = False
         scheduler = Scheduler(clock=FakeClock())
         service = make_mqtt_service(inverter=inverter, scheduler=scheduler)
 
@@ -581,11 +598,52 @@ class GrowattRecoveryTest(unittest.TestCase):  # pylint: disable=too-many-public
         scheduler.run_pending()
         inverter.write_config.assert_called_once_with("OutputConfig", "SBU")
 
+    def test_accepted_command_publishes_optimistic_state_echo(self):
+        """The UI must see the expected value as soon as a write is accepted."""
+
+        inverter = Mock()
+        inverter.consecutive_read_failures = 0
+        inverter.has_pending_readback = False
+        inverter.write_config.return_value = 30
+        scheduler = Scheduler(clock=FakeClock())
+        service = make_mqtt_service(inverter=inverter, scheduler=scheduler)
+
+        service._on_message(  # pylint: disable=protected-access
+            service._client,  # pylint: disable=protected-access
+            None,
+            FakeMqttMessage("growatt/spf5000es/config/max_charge_amps/set", "30"),
+        )
+        scheduler.run_pending()
+
+        self.assertIn(
+            ("growatt/spf5000es/config/max_charge_amps/state", "30", True),
+            fake_mqtt_client(service).published,
+        )
+
+    def test_config_publish_rearms_while_readback_pending(self):
+        """Config publishes must retry soon while a write awaits read-back."""
+
+        inverter = Mock()
+        inverter.consecutive_read_failures = 0
+        inverter.has_pending_readback = True
+        inverter.read_config.return_value = {}
+        scheduler = Scheduler(clock=FakeClock())
+        service = make_mqtt_service(inverter=inverter, scheduler=scheduler)
+        service._connected = True  # pylint: disable=protected-access
+
+        scheduler.schedule(TASK_MQTT_CONFIG, 0.0)
+        scheduler.run_pending()
+
+        self.assertEqual(
+            scheduler.next_timeout(), GrowattMqttService.CONFIG_VERIFY_RETRY_SEC
+        )
+
     def test_time_sync_command_runs_via_command_queue(self):
         """The HA sync-time button must trigger sync on the loop thread."""
 
         inverter = Mock()
         inverter.consecutive_read_failures = 0
+        inverter.has_pending_readback = False
         scheduler = Scheduler(clock=FakeClock())
         service = make_mqtt_service(inverter=inverter, scheduler=scheduler)
 
@@ -686,7 +744,9 @@ class GrowattRecoveryTest(unittest.TestCase):  # pylint: disable=too-many-public
         clock.advance(60.0)
         scheduler.run_pending()
         self.assertEqual(fake.writes, [(34, [30])])
-        self.assertEqual(fake.deferred, [0.85])
+        self.assertEqual(
+            fake.deferred, [GrowattInverter.CONFIG_WRITE_SETTLE_DELAY_SEC]
+        )
 
     def test_new_writes_do_not_delay_a_pending_flush(self):
         """A second queued write must not push back the armed flush deadline."""
@@ -706,6 +766,71 @@ class GrowattRecoveryTest(unittest.TestCase):  # pylint: disable=too-many-public
         scheduler.run_pending()
 
         self.assertEqual(fake.writes, [(34, [30]), (38, [20])])
+
+    def test_write_config_returns_expected_readback_value(self):
+        """write_config must report the value a verified read will show."""
+
+        inverter = GrowattInverter(
+            make_modbus_config(), Scheduler(clock=FakeClock())
+        )
+        inverter.client = FakeGrowattClient()
+
+        self.assertEqual(inverter.write_config("MaxChargeAmps", 30), 30)
+        self.assertEqual(inverter.write_config("BatLowtoUti", 46), 46.0)
+
+    def test_stale_readback_is_suppressed_until_write_is_visible(self):
+        """A pre-write device value must never be reported after a write."""
+
+        clock = FakeClock()
+        scheduler = Scheduler(clock=clock)
+        inverter = GrowattInverter(make_modbus_config(), scheduler)
+        fake = FakeGrowattClient()
+        inverter.client = fake
+        fake.holding[34] = 25  # device still reports the old value
+
+        inverter.write_config("MaxChargeAmps", 30)
+        clock.advance(0.25)
+        scheduler.run_pending()  # flush writes; device read-back still stale
+        self.assertEqual(fake.writes, [(34, [30])])
+
+        self.assertNotIn("MaxChargeAmps", inverter.read_config())
+        self.assertTrue(inverter.has_pending_readback)
+
+        fake.apply_writes()  # device finally reflects the write
+        self.assertEqual(inverter.read_config()["MaxChargeAmps"], 30)
+        self.assertFalse(inverter.has_pending_readback)
+
+    def test_stale_readback_gives_up_after_grace_period(self):
+        """Suppression must not hide a key forever if the device never agrees."""
+
+        clock = FakeClock()
+        scheduler = Scheduler(clock=clock)
+        inverter = GrowattInverter(make_modbus_config(), scheduler)
+        fake = FakeGrowattClient()
+        inverter.client = fake
+        fake.holding[34] = 25
+
+        inverter.write_config("MaxChargeAmps", 30)
+        clock.advance(0.25)
+        scheduler.run_pending()
+        self.assertNotIn("MaxChargeAmps", inverter.read_config())
+
+        clock.advance(GrowattInverter.READBACK_GRACE_SEC)
+        self.assertEqual(inverter.read_config()["MaxChargeAmps"], 25)
+        self.assertFalse(inverter.has_pending_readback)
+
+    def test_unflushed_write_already_suppresses_stale_reads(self):
+        """Config reads between queue and flush must not report old values."""
+
+        clock = FakeClock()
+        scheduler = Scheduler(clock=clock)
+        inverter = GrowattInverter(make_modbus_config(), scheduler)
+        fake = FakeGrowattClient()
+        inverter.client = fake
+        fake.holding[34] = 25
+
+        inverter.write_config("MaxChargeAmps", 30)
+        self.assertNotIn("MaxChargeAmps", inverter.read_config())
 
     def test_time_sync_runs_when_due_and_reschedules(self):
         """The scheduled time sync should write the clock and re-arm itself."""
@@ -751,6 +876,7 @@ class GrowattRecoveryTest(unittest.TestCase):  # pylint: disable=too-many-public
 
         inverter = Mock()
         inverter.consecutive_read_failures = 0
+        inverter.has_pending_readback = False
         scheduler = Scheduler(clock=FakeClock())
         service = make_mqtt_service(inverter=inverter, scheduler=scheduler)
         scheduler.schedule(TASK_MQTT_STATUS, 0.0)
@@ -767,6 +893,7 @@ class GrowattRecoveryTest(unittest.TestCase):  # pylint: disable=too-many-public
 
         inverter = Mock()
         inverter.consecutive_read_failures = 0
+        inverter.has_pending_readback = False
         inverter.read_status.return_value = {"SystemStatus": "Standby"}
         inverter.read_config.return_value = {"OutputConfig": "SBU"}
         scheduler = Scheduler(clock=FakeClock())
@@ -795,6 +922,7 @@ class GrowattRecoveryTest(unittest.TestCase):  # pylint: disable=too-many-public
 
         inverter = Mock()
         inverter.consecutive_read_failures = 0
+        inverter.has_pending_readback = False
         inverter.read_status.return_value = {"SystemStatus": "Standby"}
         scheduler = Scheduler(clock=FakeClock())
         service = make_mqtt_service(inverter=inverter, scheduler=scheduler)
@@ -810,6 +938,7 @@ class GrowattRecoveryTest(unittest.TestCase):  # pylint: disable=too-many-public
 
         inverter = Mock()
         inverter.consecutive_read_failures = 0
+        inverter.has_pending_readback = False
         inverter.read_status.side_effect = ModbusException("boom")
         scheduler = Scheduler(clock=FakeClock())
         service = make_mqtt_service(inverter=inverter, scheduler=scheduler)
@@ -822,6 +951,7 @@ class GrowattRecoveryTest(unittest.TestCase):  # pylint: disable=too-many-public
         inverter.read_status.side_effect = None
         inverter.read_status.return_value = {"SystemStatus": "Standby"}
         inverter.consecutive_read_failures = 0
+        inverter.has_pending_readback = False
         service.publish_status()
 
         topic = "growatt/spf5000es/inverter/availability"
@@ -1030,6 +1160,7 @@ class SchedulerTest(unittest.TestCase):
 
         inverter = Mock()
         inverter.consecutive_read_failures = 0
+        inverter.has_pending_readback = False
         inverter.read_status.side_effect = ModbusException("boom")
         clock = FakeClock()
         scheduler = Scheduler(clock=clock)
@@ -1052,6 +1183,7 @@ class SchedulerTest(unittest.TestCase):
 
         inverter = Mock()
         inverter.consecutive_read_failures = 0
+        inverter.has_pending_readback = False
         inverter.read_config.side_effect = ModbusException("boom")
         scheduler = Scheduler(clock=FakeClock())
         service = make_mqtt_service(inverter=inverter, scheduler=scheduler)
