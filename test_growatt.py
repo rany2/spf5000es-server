@@ -896,8 +896,12 @@ class GrowattRecoveryTest(unittest.TestCase):  # pylint: disable=too-many-public
 
         self.assertEqual(fake.writes, [(35, [564])])
 
-    def test_lithium_battery_type_switches_soc_scaling(self):
-        """Lithium systems read/write BatLowtoUti/uwAC2BatVolt as raw percent."""
+    def test_lithium_battery_type_keeps_tenth_unit_scaling(self):
+        """Lithium keeps the 0.1-unit register scale; only the unit changes.
+
+        Real SPF5000ES hardware stores BatLowtoUti/uwAC2BatVolt in 0.1 %
+        units under lithium (e.g. register 300 == 30.0 %), the same x10
+        scale as the 0.1 V non-lithium mode."""
 
         clock = FakeClock()
         scheduler = Scheduler(clock=clock)
@@ -914,17 +918,17 @@ class GrowattRecoveryTest(unittest.TestCase):  # pylint: disable=too-many-public
         self.assertEqual(info["BatLowtoUti"], 46.0)
         self.assertEqual(info["uwAC2BatVolt"], 50.0)
 
-        fake.holding[37] = 50
+        fake.holding[37] = 250
         fake.holding[39] = 3  # Lithium
-        fake.holding[95] = 20
+        fake.holding[95] = 300
 
         info = inverter.read_config()
-        self.assertEqual(info["BatLowtoUti"], 50)
-        self.assertEqual(info["uwAC2BatVolt"], 20)
+        self.assertEqual(info["BatLowtoUti"], 25.0)
+        self.assertEqual(info["uwAC2BatVolt"], 30.0)
 
-        self.assertEqual(inverter.write_config("uwAC2BatVolt", 60), 60)
+        self.assertEqual(inverter.write_config("uwAC2BatVolt", 30), 30.0)
         scheduler.run_pending()
-        self.assertEqual(fake.writes, [(95, [60])])
+        self.assertEqual(fake.writes, [(95, [300])])
 
     def test_stale_readback_is_suppressed_until_write_is_visible(self):
         """A pre-write device value must never be reported after a write."""

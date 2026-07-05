@@ -501,10 +501,6 @@ CONFIG_NUMBER_LIMITS = {
 
 BATTERY_DEPENDENT_NUMBER_KEYS = ("BatLowtoUti", "uwAC2BatVolt")
 LITHIUM_BATTERY_TYPES = {"Lithium"}
-LITHIUM_BATTERY_TYPE_CODES = {
-    code for code, name in BATTERY_TYPE_R.items() if name in LITHIUM_BATTERY_TYPES
-}
-BATTERY_TYPE_REGISTER = HOLDING_AND_WRITE_REGISTERS["BatteryType"][0]
 BATTERY_SOC_NUMBER_LIMITS = {"min": 5, "max": 100, "step": 1}
 BATTERY_VOLT_NUMBER_LIMITS = {"min": 20.0, "max": 64.0, "step": 0.1}
 BATTERY_FALLBACK_NUMBER_LIMITS = {
@@ -513,12 +509,6 @@ BATTERY_FALLBACK_NUMBER_LIMITS = {
     "step": min(BATTERY_SOC_NUMBER_LIMITS["step"], BATTERY_VOLT_NUMBER_LIMITS["step"]),
 }
 BATTERY_UNIT_NUMBER_KEYS = ("BatLowtoUti", "uwAC2BatVolt")
-
-
-def soc_percent_write(value: Union[str, int, float]) -> int:
-    """Encode a whole-percent SOC threshold for lithium battery types."""
-
-    return round(float(value))
 
 
 class WriteQueueFullError(RuntimeError):
@@ -1093,7 +1083,6 @@ class GrowattInverter:  # pylint: disable=too-many-instance-attributes
         self._scheduler = scheduler
         self._lock = RLock()
         self._consecutive_read_failures = 0
-        self._battery_type_raw: Optional[int] = None
         scheduler.register(TASK_WRITE_FLUSH, self.flush_pending_writes, priority=10)
         scheduler.register(TASK_TIME_SYNC, self.sync_time, priority=90)
         logger.info(
@@ -1428,12 +1417,7 @@ class GrowattInverter:  # pylint: disable=too-many-instance-attributes
             reg = self._tracked_read(
                 self.client.read_holding_registers, HOLDING_REGISTER_WINDOWS
             )
-            self._battery_type_raw = reg[BATTERY_TYPE_REGISTER]
             info = self._decode_register_table(reg, HOLDING_AND_WRITE_REGISTERS)
-            if self._battery_type_raw in LITHIUM_BATTERY_TYPE_CODES:
-                # Lithium reports these as whole-percent SOC, not 0.1 V.
-                for key in BATTERY_DEPENDENT_NUMBER_KEYS:
-                    info[key] = reg[HOLDING_AND_WRITE_REGISTERS[key][0]]
             for key in self._reconcile_pending_readback(reg):
                 info.pop(key, None)
             logger.debug("Completed inverter config read fields=%s", len(info))
@@ -1499,14 +1483,6 @@ class GrowattInverter:  # pylint: disable=too-many-instance-attributes
             if not writepreprocess:
                 logger.warning("Rejected write to read-only config key=%s", key)
                 raise ValueError("Register is not writeable")
-
-            if (
-                key in BATTERY_DEPENDENT_NUMBER_KEYS
-                and self._battery_type_raw in LITHIUM_BATTERY_TYPE_CODES
-            ):
-                # Lithium stores these as whole-percent SOC, not 0.1 V.
-                writepreprocess = soc_percent_write
-                postprocess = int
 
             try:
                 value = writepreprocess(value)
