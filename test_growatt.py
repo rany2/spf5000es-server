@@ -507,7 +507,7 @@ class GrowattRecoveryTest(unittest.TestCase):  # pylint: disable=too-many-public
             "max_charge_amps": {"min": 0, "max": 180, "step": 1},
             "bulk_charge_volt": {"min": 50.0, "max": 64.0, "step": 0.1},
             "float_charge_volt": {"min": 50.0, "max": 56.0, "step": 0.1},
-            "bat_lowto_uti": {"min": 0.5, "max": 64.0, "step": 0.1},
+            "bat_lowto_uti": {"min": 5, "max": 100, "step": 0.1},
             "sys_weekly": {"min": 0, "max": 6, "step": 1},
             "li_protocol_type": {"min": 1, "max": 99, "step": 1},
         }
@@ -519,6 +519,80 @@ class GrowattRecoveryTest(unittest.TestCase):  # pylint: disable=too-many-public
             payload = json.loads(messages[topic])
             for field, value in limits.items():
                 self.assertEqual(payload[field], value, f"{slug}.{field}")
+
+    def test_uw_ac2_bat_volt_keeps_key_without_volt_name_or_unit(self):
+        """uwAC2BatVolt keeps its ids but drops "Volt" and the static unit."""
+
+        service = make_mqtt_service()
+
+        client = fake_mqtt_client(service)
+        service._on_connect(client, None, None, 0)  # pylint: disable=protected-access
+
+        messages = {topic: payload for topic, payload, _retain in client.published}
+        topic = (
+            "homeassistant/number/growatt_spf5000es/"
+            "growatt_spf5000es_uw_ac2_bat_volt/config"
+        )
+        payload = json.loads(messages[topic])
+        self.assertEqual(payload["name"], "uw AC2 Bat")
+        self.assertEqual(payload["object_id"], "growatt_spf5000es_uw_ac2_bat_volt")
+        self.assertEqual(
+            payload["unique_id"],
+            "growatt_spf5000es_growatt_spf5000es_uw_ac2_bat_volt",
+        )
+        self.assertEqual(
+            payload["state_topic"], "growatt/spf5000es/config/uw_ac2_bat_volt/state"
+        )
+        self.assertEqual(
+            payload["command_topic"], "growatt/spf5000es/config/uw_ac2_bat_volt/set"
+        )
+        # Until the battery type is known the value may be volts or percent.
+        self.assertNotIn("unit_of_measurement", payload)
+        self.assertNotIn("device_class", payload)
+
+    def test_battery_type_switches_battery_dependent_limits(self):
+        """BatLowtoUti/uwAC2BatVolt limits must track the reported battery type."""
+
+        inverter = Mock()
+        inverter.consecutive_read_failures = 0
+        inverter.has_pending_readback = False
+        inverter.read_config.return_value = {"BatteryType": "Lithium"}
+        service = make_mqtt_service(inverter=inverter)
+        service._connected = True  # pylint: disable=protected-access
+        client = fake_mqtt_client(service)
+        topics = [
+            "homeassistant/number/growatt_spf5000es/"
+            f"growatt_spf5000es_{slug}/config"
+            for slug in ("bat_lowto_uti", "uw_ac2_bat_volt")
+        ]
+
+        service.publish_config()
+        messages = {topic: payload for topic, payload, _retain in client.published}
+        for topic in topics:
+            payload = json.loads(messages[topic])
+            self.assertEqual(payload["min"], 5, topic)
+            self.assertEqual(payload["max"], 100, topic)
+            self.assertEqual(payload["step"], 1, topic)
+            self.assertEqual(payload["unit_of_measurement"], "%", topic)
+            self.assertNotIn("device_class", payload, topic)
+
+        client.published.clear()
+        service.publish_config()
+        republished = [topic for topic, _payload, _retain in client.published]
+        for topic in topics:
+            self.assertNotIn(topic, republished)
+
+        inverter.read_config.return_value = {"BatteryType": "AGM"}
+        client.published.clear()
+        service.publish_config()
+        messages = {topic: payload for topic, payload, _retain in client.published}
+        for topic in topics:
+            payload = json.loads(messages[topic])
+            self.assertEqual(payload["min"], 20.0, topic)
+            self.assertEqual(payload["max"], 64.0, topic)
+            self.assertEqual(payload["step"], 0.1, topic)
+            self.assertEqual(payload["unit_of_measurement"], "V", topic)
+            self.assertEqual(payload["device_class"], "voltage", topic)
 
     def test_mqtt_discovery_exposes_read_only_boolean_as_binary_sensor(self):
         """Boolean config states should not be discovered as numeric sensors."""
@@ -805,6 +879,52 @@ class GrowattRecoveryTest(unittest.TestCase):  # pylint: disable=too-many-public
 
         self.assertEqual(inverter.write_config("MaxChargeAmps", 30), 30)
         self.assertEqual(inverter.write_config("BatLowtoUti", 46), 46.0)
+
+    def test_scaled_write_preserves_tenths(self):
+        """Fractional 0.1-unit values must round to the nearest raw register."""
+
+        clock = FakeClock()
+        scheduler = Scheduler(clock=clock)
+        inverter = GrowattInverter(
+            make_modbus_config(write_batch_delay_sec=0), scheduler
+        )
+        fake = FakeGrowattClient()
+        inverter.client = fake
+
+        self.assertEqual(inverter.write_config("BulkChargeVolt", 56.4), 56.4)
+        scheduler.run_pending()
+
+        self.assertEqual(fake.writes, [(35, [564])])
+
+    def test_lithium_battery_type_switches_soc_scaling(self):
+        """Lithium systems read/write BatLowtoUti/uwAC2BatVolt as raw percent."""
+
+        clock = FakeClock()
+        scheduler = Scheduler(clock=clock)
+        inverter = GrowattInverter(
+            make_modbus_config(write_batch_delay_sec=0), scheduler
+        )
+        fake = FakeGrowattClient()
+        inverter.client = fake
+        fake.holding[37] = 460
+        fake.holding[39] = 0  # AGM
+        fake.holding[95] = 500
+
+        info = inverter.read_config()
+        self.assertEqual(info["BatLowtoUti"], 46.0)
+        self.assertEqual(info["uwAC2BatVolt"], 50.0)
+
+        fake.holding[37] = 50
+        fake.holding[39] = 3  # Lithium
+        fake.holding[95] = 20
+
+        info = inverter.read_config()
+        self.assertEqual(info["BatLowtoUti"], 50)
+        self.assertEqual(info["uwAC2BatVolt"], 20)
+
+        self.assertEqual(inverter.write_config("uwAC2BatVolt", 60), 60)
+        scheduler.run_pending()
+        self.assertEqual(fake.writes, [(95, [60])])
 
     def test_stale_readback_is_suppressed_until_write_is_visible(self):
         """A pre-write device value must never be reported after a write."""

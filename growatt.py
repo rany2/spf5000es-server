@@ -292,9 +292,27 @@ HOLDING_AND_WRITE_REGISTERS = {
     "ResetUserInfo": (32, 1, RegType.UINT, int, int),
     "ResetToFactory": (33, 1, RegType.UINT, int, int),
     "MaxChargeAmps": (34, 1, RegType.UINT, int, int),
-    "BulkChargeVolt": (35, 1, RegType.UINT, lambda x: x / 10, lambda x: int(x) * 10),
-    "FloatChargeVolt": (36, 1, RegType.UINT, lambda x: x / 10, lambda x: int(x) * 10),
-    "BatLowtoUti": (37, 1, RegType.UINT, lambda x: x / 10, lambda x: int(x) * 10),
+    "BulkChargeVolt": (
+        35,
+        1,
+        RegType.UINT,
+        lambda x: x / 10,
+        lambda x: round(float(x) * 10),
+    ),
+    "FloatChargeVolt": (
+        36,
+        1,
+        RegType.UINT,
+        lambda x: x / 10,
+        lambda x: round(float(x) * 10),
+    ),
+    "BatLowtoUti": (
+        37,
+        1,
+        RegType.UINT,
+        lambda x: x / 10,
+        lambda x: round(float(x) * 10),
+    ),
     "ACChargeAmps": (38, 1, RegType.UINT, int, int),
     "BatteryType": (
         39,
@@ -354,7 +372,13 @@ HOLDING_AND_WRITE_REGISTERS = {
     "NomOpVRaw": (89, 1, RegType.UINT, int, None),
     "NomOpFreqRaw": (90, 1, RegType.UINT, int, None),
     "NomOpPowRaw": (91, 1, RegType.UINT, int, None),
-    "uwAC2BatVolt": (95, 1, RegType.UINT, lambda x: x / 10, lambda x: int(x) * 10),
+    "uwAC2BatVolt": (
+        95,
+        1,
+        RegType.UINT,
+        lambda x: x / 10,
+        lambda x: round(float(x) * 10),
+    ),
     "BypEnable": (96, 1, RegType.UINT, bool, str2bool2int),
     "PowSavingEnable": (97, 1, RegType.UINT, bool, str2bool2int),
     "SpowBalEnable": (98, 1, RegType.UINT, bool, str2bool2int),
@@ -444,6 +468,9 @@ MQTT_ENTITY_METADATA = {
     "SCCComMode": {"icon": "mdi:connection"},
     "ComboardVer": {"icon": "mdi:chip"},
     "uwBatPieceNum": {"icon": "mdi:battery-multiple"},
+    # No "Volt" in the name: the value is a voltage or an SOC percentage
+    # depending on the battery type.
+    "uwAC2BatVolt": {"name": "uw AC2 Bat"},
     "LiProtocolType": {"icon": "mdi:protocol"},
     "BLVersion2": {"icon": "mdi:chip"},
 }
@@ -461,8 +488,6 @@ CONFIG_NUMBER_LIMITS = {
     "MaxChargeAmps": {"min": 0, "max": 180, "step": 1},
     "BulkChargeVolt": {"min": 50.0, "max": 64.0, "step": 0.1},
     "FloatChargeVolt": {"min": 50.0, "max": 56.0, "step": 0.1},
-    # Raw 200~640 (0.1 V, non-lithium) or 5~100 (0.1 %, lithium).
-    "BatLowtoUti": {"min": 0.5, "max": 64.0, "step": 0.1},
     "ACChargeAmps": {"min": 0, "max": 100, "step": 1},
     "SysYear": {"min": 2000, "max": 2099, "step": 1},
     "SysMonth": {"min": 1, "max": 12, "step": 1},
@@ -471,10 +496,29 @@ CONFIG_NUMBER_LIMITS = {
     "SysMin": {"min": 0, "max": 59, "step": 1},
     "SysSec": {"min": 0, "max": 59, "step": 1},
     "SysWeekly": {"min": 0, "max": 6, "step": 1},
-    # Raw 200~640 (0.1 V, non-lithium) or 5~100 (0.1 %, lithium).
-    "uwAC2BatVolt": {"min": 0.5, "max": 64.0, "step": 0.1},
     "LiProtocolType": {"min": 1, "max": 99, "step": 1},
 }
+
+BATTERY_DEPENDENT_NUMBER_KEYS = ("BatLowtoUti", "uwAC2BatVolt")
+LITHIUM_BATTERY_TYPES = {"Lithium"}
+LITHIUM_BATTERY_TYPE_CODES = {
+    code for code, name in BATTERY_TYPE_R.items() if name in LITHIUM_BATTERY_TYPES
+}
+BATTERY_TYPE_REGISTER = HOLDING_AND_WRITE_REGISTERS["BatteryType"][0]
+BATTERY_SOC_NUMBER_LIMITS = {"min": 5, "max": 100, "step": 1}
+BATTERY_VOLT_NUMBER_LIMITS = {"min": 20.0, "max": 64.0, "step": 0.1}
+BATTERY_FALLBACK_NUMBER_LIMITS = {
+    "min": min(BATTERY_SOC_NUMBER_LIMITS["min"], BATTERY_VOLT_NUMBER_LIMITS["min"]),
+    "max": max(BATTERY_SOC_NUMBER_LIMITS["max"], BATTERY_VOLT_NUMBER_LIMITS["max"]),
+    "step": min(BATTERY_SOC_NUMBER_LIMITS["step"], BATTERY_VOLT_NUMBER_LIMITS["step"]),
+}
+BATTERY_UNIT_NUMBER_KEYS = ("BatLowtoUti", "uwAC2BatVolt")
+
+
+def soc_percent_write(value: Union[str, int, float]) -> int:
+    """Encode a whole-percent SOC threshold for lithium battery types."""
+
+    return round(float(value))
 
 
 class WriteQueueFullError(RuntimeError):
@@ -1049,6 +1093,7 @@ class GrowattInverter:  # pylint: disable=too-many-instance-attributes
         self._scheduler = scheduler
         self._lock = RLock()
         self._consecutive_read_failures = 0
+        self._battery_type_raw: Optional[int] = None
         scheduler.register(TASK_WRITE_FLUSH, self.flush_pending_writes, priority=10)
         scheduler.register(TASK_TIME_SYNC, self.sync_time, priority=90)
         logger.info(
@@ -1383,7 +1428,12 @@ class GrowattInverter:  # pylint: disable=too-many-instance-attributes
             reg = self._tracked_read(
                 self.client.read_holding_registers, HOLDING_REGISTER_WINDOWS
             )
+            self._battery_type_raw = reg[BATTERY_TYPE_REGISTER]
             info = self._decode_register_table(reg, HOLDING_AND_WRITE_REGISTERS)
+            if self._battery_type_raw in LITHIUM_BATTERY_TYPE_CODES:
+                # Lithium reports these as whole-percent SOC, not 0.1 V.
+                for key in BATTERY_DEPENDENT_NUMBER_KEYS:
+                    info[key] = reg[HOLDING_AND_WRITE_REGISTERS[key][0]]
             for key in self._reconcile_pending_readback(reg):
                 info.pop(key, None)
             logger.debug("Completed inverter config read fields=%s", len(info))
@@ -1449,6 +1499,14 @@ class GrowattInverter:  # pylint: disable=too-many-instance-attributes
             if not writepreprocess:
                 logger.warning("Rejected write to read-only config key=%s", key)
                 raise ValueError("Register is not writeable")
+
+            if (
+                key in BATTERY_DEPENDENT_NUMBER_KEYS
+                and self._battery_type_raw in LITHIUM_BATTERY_TYPE_CODES
+            ):
+                # Lithium stores these as whole-percent SOC, not 0.1 V.
+                writepreprocess = soc_percent_write
+                postprocess = int
 
             try:
                 value = writepreprocess(value)
@@ -1563,6 +1621,7 @@ class GrowattMqttService:  # pylint: disable=too-many-instance-attributes
         self._client = self._make_client()
         self._connected = False
         self._inverter_available: Optional[bool] = None
+        self._battery_type: Optional[str] = None
         self._status_retry_delay_sec = self.STATUS_INTERVAL_SEC
         self._commands: deque[tuple[str, str]] = deque()
         self._slug_to_config_key = {
@@ -2069,13 +2128,60 @@ class GrowattMqttService:  # pylint: disable=too-many-instance-attributes
             component = "text"
         else:
             payload.update(self._sensor_metadata(key))
-            payload.update(
-                CONFIG_NUMBER_LIMITS.get(key, {"min": 0, "max": 65535, "step": 1})
-            )
+            payload.update(self._number_limits(key))
+            if key in BATTERY_UNIT_NUMBER_KEYS:
+                for field in ("device_class", "unit_of_measurement", "state_class"):
+                    payload.pop(field, None)
+                payload.update(self._battery_unit_metadata())
             payload["mode"] = "box"
             component = "number"
 
         return component, payload
+
+    def _battery_unit_metadata(self) -> Dict[str, str]:
+        """Return unit metadata that follows the current battery type."""
+
+        if self._battery_type is None:
+            return {}
+        if self._battery_type in LITHIUM_BATTERY_TYPES:
+            return {
+                "icon": "mdi:percent-outline",
+                "unit_of_measurement": "%",
+                "state_class": "measurement",
+            }
+        return {
+            "device_class": "voltage",
+            "icon": "mdi:sine-wave",
+            "unit_of_measurement": "V",
+            "state_class": "measurement",
+        }
+
+    def _number_limits(self, key: str) -> Dict[str, Any]:
+        """Return number entity limits, honoring the current battery type."""
+
+        if key in BATTERY_DEPENDENT_NUMBER_KEYS:
+            if self._battery_type is None:
+                return BATTERY_FALLBACK_NUMBER_LIMITS
+            if self._battery_type in LITHIUM_BATTERY_TYPES:
+                return BATTERY_SOC_NUMBER_LIMITS
+            return BATTERY_VOLT_NUMBER_LIMITS
+        return CONFIG_NUMBER_LIMITS.get(key, {"min": 0, "max": 65535, "step": 1})
+
+    def _refresh_battery_dependent_discovery(self, battery_type: Optional[str]):
+        """Republish discovery for entities whose limits track the battery type."""
+
+        if battery_type is None or battery_type == self._battery_type:
+            return
+        logger.info(
+            "Battery type changed, republishing dependent discovery type=%s",
+            battery_type,
+        )
+        self._battery_type = battery_type
+        for key in BATTERY_DEPENDENT_NUMBER_KEYS:
+            component, payload = self._config_entity_discovery_payload(
+                key, HOLDING_AND_WRITE_REGISTERS[key]
+            )
+            self._publish_discovery_payload(component, payload["object_id"], payload)
 
     def _publish_discovery_payload(
         self, component: str, object_id: str, payload: Dict[str, Any]
@@ -2149,6 +2255,7 @@ class GrowattMqttService:  # pylint: disable=too-many-instance-attributes
             self._scheduler.schedule(TASK_MQTT_CONFIG, self.CONFIG_FAILURE_RETRY_SEC)
             return
         self._publish_inverter_availability()
+        self._refresh_battery_dependent_discovery(config.get("BatteryType"))
         for key, value in config.items():
             self._client.publish(
                 self._value_topic(self.base_topic, "config", key),
