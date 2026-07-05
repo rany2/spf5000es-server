@@ -492,6 +492,34 @@ class GrowattRecoveryTest(unittest.TestCase):  # pylint: disable=too-many-public
             self.assertEqual(payload["max"], 65535)
             self.assertEqual(payload["step"], 1)
 
+    def test_mqtt_discovery_sets_protocol_number_limits(self):
+        """Config entities with documented protocol ranges should expose them."""
+
+        service = make_mqtt_service()
+
+        client = fake_mqtt_client(service)
+        service._on_connect(client, None, None, 0)  # pylint: disable=protected-access
+
+        messages = {topic: payload for topic, payload, _retain in client.published}
+        expected = {
+            "uti_out_start": {"min": 0, "max": 23, "step": 1},
+            "com_address": {"min": 1, "max": 254, "step": 1},
+            "max_charge_amps": {"min": 0, "max": 180, "step": 1},
+            "bulk_charge_volt": {"min": 50.0, "max": 64.0, "step": 0.1},
+            "float_charge_volt": {"min": 50.0, "max": 56.0, "step": 0.1},
+            "bat_lowto_uti": {"min": 0.5, "max": 64.0, "step": 0.1},
+            "sys_weekly": {"min": 0, "max": 6, "step": 1},
+            "li_protocol_type": {"min": 1, "max": 99, "step": 1},
+        }
+        for slug, limits in expected.items():
+            topic = (
+                "homeassistant/number/growatt_spf5000es/"
+                f"growatt_spf5000es_{slug}/config"
+            )
+            payload = json.loads(messages[topic])
+            for field, value in limits.items():
+                self.assertEqual(payload[field], value, f"{slug}.{field}")
+
     def test_mqtt_discovery_exposes_read_only_boolean_as_binary_sensor(self):
         """Boolean config states should not be discovered as numeric sensors."""
 

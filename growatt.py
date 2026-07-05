@@ -449,12 +449,31 @@ MQTT_ENTITY_METADATA = {
 }
 
 CONFIG_NUMBER_LIMITS = {
+    "UtiOutStart": {"min": 0, "max": 23, "step": 1},
+    "UtiOutEnd": {"min": 0, "max": 23, "step": 1},
+    "UtiChargeStart": {"min": 0, "max": 23, "step": 1},
+    "UtiChargeEnd": {"min": 0, "max": 23, "step": 1},
+    "LCDLanguage": {"min": 0, "max": 1, "step": 1},
+    "MoudleH": {"min": 0, "max": 1, "step": 1},
+    "ComAddress": {"min": 1, "max": 254, "step": 1},
+    "ResetUserInfo": {"min": 0, "max": 1, "step": 1},
+    "ResetToFactory": {"min": 0, "max": 1, "step": 1},
+    "MaxChargeAmps": {"min": 0, "max": 180, "step": 1},
+    "BulkChargeVolt": {"min": 50.0, "max": 64.0, "step": 0.1},
+    "FloatChargeVolt": {"min": 50.0, "max": 56.0, "step": 0.1},
+    # Raw 200~640 (0.1 V, non-lithium) or 5~100 (0.1 %, lithium).
+    "BatLowtoUti": {"min": 0.5, "max": 64.0, "step": 0.1},
+    "ACChargeAmps": {"min": 0, "max": 100, "step": 1},
     "SysYear": {"min": 2000, "max": 2099, "step": 1},
     "SysMonth": {"min": 1, "max": 12, "step": 1},
     "SysDay": {"min": 1, "max": 31, "step": 1},
     "SysHour": {"min": 0, "max": 23, "step": 1},
     "SysMin": {"min": 0, "max": 59, "step": 1},
     "SysSec": {"min": 0, "max": 59, "step": 1},
+    "SysWeekly": {"min": 0, "max": 6, "step": 1},
+    # Raw 200~640 (0.1 V, non-lithium) or 5~100 (0.1 %, lithium).
+    "uwAC2BatVolt": {"min": 0.5, "max": 64.0, "step": 0.1},
+    "LiProtocolType": {"min": 1, "max": 99, "step": 1},
 }
 
 
