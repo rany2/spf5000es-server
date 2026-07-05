@@ -277,7 +277,6 @@ def make_mqtt_config(**overrides):
         "discovery_prefix": "homeassistant",
         "device_id": "growatt_spf5000es",
         "device_name": "Growatt SPF 5000 ES",
-        "retain": True,
         "config_interval_sec": 300,
     }
     config.update(overrides)
@@ -1068,6 +1067,28 @@ class GrowattRecoveryTest(unittest.TestCase):  # pylint: disable=too-many-public
                 "growatt/spf5000es/status/system_status/state",
             ],
         )
+
+    def test_status_is_not_retained_but_config_is(self):
+        """Status churns every second; only config values persist in the broker."""
+
+        inverter = Mock()
+        inverter.consecutive_read_failures = 0
+        inverter.has_pending_readback = False
+        inverter.read_status.return_value = {"SystemStatus": "Standby"}
+        inverter.read_config.return_value = {"OutputConfig": "SBU"}
+        scheduler = Scheduler(clock=FakeClock())
+        service = make_mqtt_service(inverter=inverter, scheduler=scheduler)
+        service._connected = True  # pylint: disable=protected-access
+        scheduler.schedule(TASK_MQTT_STATUS, 0.0)
+        scheduler.schedule(TASK_MQTT_CONFIG, 0.0)
+
+        scheduler.run_pending()
+
+        retain_by_topic = {
+            topic: retain for topic, _payload, retain in fake_mqtt_client(service).published
+        }
+        self.assertFalse(retain_by_topic["growatt/spf5000es/status/system_status/state"])
+        self.assertTrue(retain_by_topic["growatt/spf5000es/config/output_config/state"])
 
     def test_status_publish_repeats_on_interval(self):
         """A successful status publish should re-arm one second out."""

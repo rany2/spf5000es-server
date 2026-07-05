@@ -22,5 +22,4 @@ TOPIC_PREFIX = growatt/spf5000es
 DISCOVERY_PREFIX = homeassistant
 DEVICE_ID = growatt_spf5000es
 DEVICE_NAME = Growatt SPF 5000 ES
-RETAIN = true
 CONFIG_INTERVAL_SEC = 1800

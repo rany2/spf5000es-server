@@ -1557,7 +1557,6 @@ class GrowattMqttConfig:  # pylint: disable=too-many-instance-attributes
     discovery_prefix: str
     device_id: str
     device_name: str
-    retain: bool
     config_interval_sec: float
 
     def __post_init__(self):
@@ -1966,7 +1965,7 @@ class GrowattMqttService:  # pylint: disable=too-many-instance-attributes
                 self._client.publish(
                     self._value_topic(self.base_topic, "config", key),
                     self._mqtt_value(expected),
-                    retain=self.config.retain,
+                    retain=True,
                 )
             write_delay_sec = getattr(self.inverter, "write_batch_delay_sec", 0.0)
             if not isinstance(write_delay_sec, (int, float)):
@@ -2214,7 +2213,6 @@ class GrowattMqttService:  # pylint: disable=too-many-instance-attributes
             self._client.publish(
                 self._value_topic(self.base_topic, "status", key),
                 self._mqtt_value(value),
-                retain=self.config.retain,
             )
         logger.debug("MQTT status published fields=%s", len(status))
 
@@ -2236,7 +2234,7 @@ class GrowattMqttService:  # pylint: disable=too-many-instance-attributes
             self._client.publish(
                 self._value_topic(self.base_topic, "config", key),
                 self._mqtt_value(value),
-                retain=self.config.retain,
+                retain=True,
             )
         logger.debug("MQTT config published fields=%s", len(config))
         if self.inverter.has_pending_readback:
@@ -2303,7 +2301,6 @@ def read_app_config(config_path: str = "config.ini") -> GrowattAppConfig:
             ),
             device_id=mqtt_device_id,
             device_name=cfg.get("MQTT", "DEVICE_NAME", fallback="Growatt SPF 5000 ES"),
-            retain=cfg.getboolean("MQTT", "RETAIN", fallback=True),
             config_interval_sec=cfg.getfloat(
                 "MQTT", "CONFIG_INTERVAL_SEC", fallback=1800.0
             ),
