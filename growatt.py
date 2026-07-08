@@ -488,7 +488,7 @@ CONFIG_NUMBER_LIMITS = {
     "MaxChargeAmps": {"min": 0, "max": 180, "step": 1},
     "BulkChargeVolt": {"min": 50.0, "max": 64.0, "step": 0.1},
     "FloatChargeVolt": {"min": 50.0, "max": 56.0, "step": 0.1},
-    "ACChargeAmps": {"min": 0, "max": 100, "step": 1},
+    "ACChargeAmps": {"min": 0, "max": 80, "step": 1},
     "SysYear": {"min": 2000, "max": 2099, "step": 1},
     "SysMonth": {"min": 1, "max": 12, "step": 1},
     "SysDay": {"min": 1, "max": 31, "step": 1},
