@@ -1,11 +1,12 @@
-ARG ARCH=
-FROM ${ARCH}python:3.12-alpine
+FROM golang:1.24-alpine AS build
+WORKDIR /src
+COPY go.mod go.sum* ./
+RUN go mod download
+COPY *.go ./
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/spf5000es-server .
 
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
-
-COPY . /app
-RUN pip install --no-cache-dir -r /app/requirements.txt
-
+FROM alpine:3.23
+RUN apk add --no-cache ca-certificates
+COPY --from=build /out/spf5000es-server /usr/local/bin/spf5000es-server
 WORKDIR /app
-CMD ["python", "growatt.py"]
+ENTRYPOINT ["/usr/local/bin/spf5000es-server"]
