@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"fmt"
+	"math"
 	"os"
 	"strconv"
 	"strings"
@@ -27,6 +28,7 @@ type MQTTConfig struct {
 	TopicPrefix, DiscoveryPrefix string
 	DeviceID, DeviceName         string
 	ConfigInterval               time.Duration
+	StatusInterval               time.Duration
 }
 
 type AppConfig struct {
@@ -97,6 +99,9 @@ func ReadAppConfig(path string) (AppConfig, error) {
 		if e != nil {
 			return 0, fmt.Errorf("invalid %s.%s: %w", s, k, e)
 		}
+		if math.IsNaN(n) || math.IsInf(n, 0) {
+			return 0, fmt.Errorf("invalid %s.%s: finite number required", s, k)
+		}
 		return n, nil
 	}
 	wq, e := intv("MODBUS", "WRITE_QUEUE_SIZE", 128)
@@ -132,6 +137,43 @@ func ReadAppConfig(path string) (AppConfig, error) {
 	if e != nil {
 		return AppConfig{}, e
 	}
+	si, e := floatv("MQTT", "STATUS_INTERVAL_SEC", 1)
+	if e != nil {
+		return AppConfig{}, e
+	}
+	if wq < 1 {
+		return AppConfig{}, fmt.Errorf("MODBUS.WRITE_QUEUE_SIZE must be positive")
+	}
+	if retries < 0 {
+		return AppConfig{}, fmt.Errorf("MODBUS.RETRIES must be non-negative")
+	}
+	if mbd < 0 || rd < 0 {
+		return AppConfig{}, fmt.Errorf("Modbus delays must be non-negative")
+	}
+	if timeout < .1 {
+		return AppConfig{}, fmt.Errorf("MODBUS.TIMEOUT_SEC must be at least 0.1")
+	}
+	if port < 1 || port > 65535 {
+		return AppConfig{}, fmt.Errorf("MQTT.PORT must be between 1 and 65535")
+	}
+	if keep < 1 {
+		return AppConfig{}, fmt.Errorf("MQTT.KEEPALIVE_SEC must be positive")
+	}
+	if ci < 1 || si < .1 {
+		return AppConfig{}, fmt.Errorf("MQTT intervals are below the supported minimum")
+	}
+	maxDurationSeconds := float64(math.MaxInt64) / float64(time.Second)
+	for name, seconds := range map[string]float64{
+		"MODBUS.WRITE_BATCH_DELAY_SEC": mbd,
+		"MODBUS.TIMEOUT_SEC":           timeout,
+		"MODBUS.RECONNECT_DELAY_SEC":   rd,
+		"MQTT.CONFIG_INTERVAL_SEC":     ci,
+		"MQTT.STATUS_INTERVAL_SEC":     si,
+	} {
+		if seconds > maxDurationSeconds {
+			return AppConfig{}, fmt.Errorf("%s is too large", name)
+		}
+	}
 	optional := func(v string) string {
 		v = strings.TrimSpace(v)
 		switch strings.ToLower(v) {
@@ -140,9 +182,25 @@ func ReadAppConfig(path string) (AppConfig, error) {
 		}
 		return v
 	}
+	host := strings.TrimSpace(get("MQTT", "HOST", "localhost"))
+	deviceID = strings.TrimSpace(deviceID)
+	clientID := strings.TrimSpace(get("MQTT", "CLIENT_ID", deviceID))
+	if host == "" || deviceID == "" || clientID == "" {
+		return AppConfig{}, fmt.Errorf("MQTT.HOST, MQTT.DEVICE_ID, and MQTT.CLIENT_ID must not be empty")
+	}
 	cfg := AppConfig{
-		Modbus:   ModbusConfig{requiredPort, max(1, wq), time.Duration(max(0.0, mbd) * float64(time.Second)), time.Duration(max(.1, timeout) * float64(time.Second)), max(0, retries), time.Duration(max(0.0, rd) * float64(time.Second))},
-		MQTT:     MQTTConfig{Host: get("MQTT", "HOST", "localhost"), Port: port, Username: optional(get("MQTT", "USER", "")), Password: optional(get("MQTT", "PASSWORD", "")), ClientID: get("MQTT", "CLIENT_ID", deviceID), Keepalive: time.Duration(max(1, keep)) * time.Second, TopicPrefix: strings.Trim(get("MQTT", "TOPIC_PREFIX", deviceID), "/"), DiscoveryPrefix: strings.Trim(get("MQTT", "DISCOVERY_PREFIX", "homeassistant"), "/"), DeviceID: deviceID, DeviceName: get("MQTT", "DEVICE_NAME", "Growatt SPF 5000 ES"), ConfigInterval: time.Duration(max(1.0, ci) * float64(time.Second))},
+		Modbus: ModbusConfig{
+			Port: requiredPort, WriteQueueSize: wq,
+			WriteBatchDelay: time.Duration(mbd * float64(time.Second)), Timeout: time.Duration(timeout * float64(time.Second)),
+			Retries: retries, ReconnectDelay: time.Duration(rd * float64(time.Second)),
+		},
+		MQTT: MQTTConfig{
+			Host: host, Port: port, Username: optional(get("MQTT", "USER", "")), Password: optional(get("MQTT", "PASSWORD", "")),
+			ClientID: clientID, Keepalive: time.Duration(keep) * time.Second,
+			TopicPrefix: strings.Trim(get("MQTT", "TOPIC_PREFIX", deviceID), "/"), DiscoveryPrefix: strings.Trim(get("MQTT", "DISCOVERY_PREFIX", "homeassistant"), "/"),
+			DeviceID: deviceID, DeviceName: get("MQTT", "DEVICE_NAME", "Growatt SPF 5000 ES"),
+			ConfigInterval: time.Duration(ci * float64(time.Second)), StatusInterval: time.Duration(si * float64(time.Second)),
+		},
 		LogLevel: get("LOGGING", "LEVEL", "INFO"),
 	}
 	if cfg.MQTT.TopicPrefix == "" {

@@ -16,23 +16,37 @@ import (
 
 const (
 	statusInterval               = time.Second
+	statusFullSnapshotInterval   = time.Minute
 	statusFailureBackoffMax      = 30 * time.Second
 	configFailureRetry           = 30 * time.Second
 	configVerifyRetry            = 2 * time.Second
 	commandQueueMax              = 32
 	inverterOfflineAfterFailures = 3
+	mqttOperationTimeout         = 5 * time.Second
 )
 
 type mqttPublisher interface {
-	Publish(string, any, bool)
-	Subscribe(string)
+	Publish(string, any, bool) error
+	Subscribe(string) error
 	Disconnect()
 }
 type pahoPublisher struct{ client mqtt.Client }
 
-func (p *pahoPublisher) Publish(t string, v any, r bool) { p.client.Publish(t, 0, r, v) }
-func (p *pahoPublisher) Subscribe(t string)              { p.client.Subscribe(t, 0, nil) }
-func (p *pahoPublisher) Disconnect()                     { p.client.Disconnect(250) }
+func (p *pahoPublisher) Publish(topic string, value any, retained bool) error {
+	token := p.client.Publish(topic, 0, retained, value)
+	if !token.WaitTimeout(mqttOperationTimeout) {
+		return fmt.Errorf("MQTT publish timed out")
+	}
+	return token.Error()
+}
+func (p *pahoPublisher) Subscribe(topic string) error {
+	token := p.client.Subscribe(topic, 0, nil)
+	if !token.WaitTimeout(mqttOperationTimeout) {
+		return fmt.Errorf("MQTT subscribe timed out")
+	}
+	return token.Error()
+}
+func (p *pahoPublisher) Disconnect() { p.client.Disconnect(1000) }
 
 type mqttCommand struct{ topic, payload string }
 type MQTTService struct {
@@ -45,17 +59,22 @@ type MQTTService struct {
 	inverterAvailable *bool
 	batteryType       string
 	statusRetry       time.Duration
+	lastStatus        map[string]string
+	lastFullStatus    time.Time
+	statusGeneration  uint64
 	commands          []mqttCommand
 	slugToKey         map[string]string
 }
 
 func NewMQTTService(inv inverterAPI, cfg MQTTConfig, s *Scheduler) *MQTTService {
-	m := &MQTTService{inverter: inv, config: cfg, scheduler: s, statusRetry: statusInterval, slugToKey: make(map[string]string)}
+	if cfg.StatusInterval <= 0 {
+		cfg.StatusInterval = statusInterval
+	}
+	m := &MQTTService{inverter: inv, config: cfg, scheduler: s, statusRetry: cfg.StatusInterval, lastStatus: make(map[string]string), slugToKey: make(map[string]string)}
 	for key := range holdingRegisters {
 		m.slugToKey[slug(key)] = key
 	}
 	opts := mqtt.NewClientOptions().AddBroker(fmt.Sprintf("tcp://%s:%d", cfg.Host, cfg.Port)).SetClientID(cfg.ClientID).SetKeepAlive(cfg.Keepalive).SetAutoReconnect(true).SetConnectRetry(true).SetConnectRetryInterval(time.Second).SetMaxReconnectInterval(30*time.Second).SetWill(m.availabilityTopic(), "offline", 0, true)
-	opts.SetMessageChannelDepth(1)
 	if cfg.Username != "" {
 		opts.SetUsername(cfg.Username)
 		opts.SetPassword(cfg.Password)
@@ -71,7 +90,7 @@ func NewMQTTService(inv inverterAPI, cfg MQTTConfig, s *Scheduler) *MQTTService 
 	m.client = &pahoPublisher{client: mqtt.NewClient(opts)}
 	mustRegister(s, taskMQTTCommands, m.drainCommands, 0, 20)
 	mustRegister(s, taskMQTTConfig, m.PublishConfig, cfg.ConfigInterval, 40)
-	mustRegister(s, taskMQTTStatus, m.PublishStatus, statusInterval, 50)
+	mustRegister(s, taskMQTTStatus, m.PublishStatus, cfg.StatusInterval, 50)
 	return m
 }
 func mustRegister(s *Scheduler, n string, f func(), d time.Duration, p int) {
@@ -85,21 +104,35 @@ func (m *MQTTService) inverterAvailabilityTopic() string {
 
 func (m *MQTTService) Start() error {
 	p := m.client.(*pahoPublisher)
-	p.client.Connect() // asynchronous; ConnectRetry keeps trying if the broker is down
+	token := p.client.Connect() // asynchronous; ConnectRetry keeps trying if the broker is down
+	go func() {
+		token.Wait()
+		if err := token.Error(); err != nil {
+			slog.Error("MQTT connection failed", "error", err)
+		}
+	}()
 	return nil
 }
 func (m *MQTTService) Stop() {
-	m.client.Publish(m.availabilityTopic(), "offline", true)
+	if err := m.client.Publish(m.availabilityTopic(), "offline", true); err != nil {
+		slog.Warn("failed to publish offline availability", "error", err)
+	}
 	m.client.Disconnect()
 }
 func (m *MQTTService) onConnect() {
 	m.mu.Lock()
 	m.connected = true
 	m.inverterAvailable = nil
+	m.lastStatus = make(map[string]string)
+	m.lastFullStatus = time.Time{}
+	m.statusGeneration++
 	m.mu.Unlock()
-	m.client.Publish(m.availabilityTopic(), "online", true)
-	m.client.Subscribe(m.baseTopic() + "/config/+/set")
-	m.client.Subscribe(m.baseTopic() + "/time_sync/set")
+	m.publish(m.availabilityTopic(), "online", true)
+	for _, topic := range []string{m.baseTopic() + "/config/+/set", m.baseTopic() + "/time_sync/set"} {
+		if err := m.client.Subscribe(topic); err != nil {
+			slog.Error("MQTT subscribe failed", "topic", topic, "error", err)
+		}
+	}
 	m.publishDiscovery()
 	must(m.scheduler.Schedule(taskMQTTConfig, 0, true))
 	must(m.scheduler.Schedule(taskMQTTStatus, 0, true))
@@ -148,7 +181,7 @@ func (m *MQTTService) handleCommand(topic, payload string) {
 		return
 	}
 	if expected != nil {
-		m.client.Publish(valueTopic(m.baseTopic(), "config", key), mqttValue(expected), true)
+		m.publish(valueTopic(m.baseTopic(), "config", key), mqttValue(expected), true)
 	}
 	delay := max(time.Second, m.inverter.WriteBatchDelay()+configWriteSettleDelay)
 	must(m.scheduler.Schedule(taskMQTTConfig, delay, true))
@@ -184,6 +217,14 @@ func mqttValue(v any) string {
 		return "false"
 	}
 	return fmt.Sprint(v)
+}
+
+func (m *MQTTService) publish(topic string, value any, retained bool) bool {
+	if err := m.client.Publish(topic, value, retained); err != nil {
+		slog.Warn("MQTT publish failed", "topic", topic, "error", err)
+		return false
+	}
+	return true
 }
 
 func wordBoundary(prev string, ch, next rune, has bool) bool {
@@ -259,10 +300,6 @@ var entityMetadata = map[string]map[string]any{
 	"OutputConfig": {"icon": "mdi:transmission-tower-export"}, "ChargeConfig": {"icon": "mdi:battery-charging"}, "UtiOutStart": {"icon": "mdi:clock-start", "unit_of_measurement": "h"}, "UtiOutEnd": {"icon": "mdi:clock-end", "unit_of_measurement": "h"}, "UtiChargeStart": {"icon": "mdi:battery-clock", "unit_of_measurement": "h"}, "UtiChargeEnd": {"icon": "mdi:battery-clock", "unit_of_measurement": "h"}, "PVModel": {"icon": "mdi:solar-panel"}, "ACInModel": {"icon": "mdi:transmission-tower-import"},
 	"FWVersion": {"icon": "mdi:chip"}, "FWVersion2": {"icon": "mdi:chip"}, "LCDLanguage": {"icon": "mdi:translate"}, "SerialNumber": {"icon": "mdi:barcode"}, "MoudleH": {"icon": "mdi:chip"}, "MoudleL": {"icon": "mdi:chip"}, "ComAddress": {"icon": "mdi:serial-port"}, "FlashStart": {"icon": "mdi:flash"}, "ResetUserInfo": {"icon": "mdi:account-sync-outline"}, "ResetToFactory": {"icon": "mdi:factory"}, "BatteryType": {"icon": "mdi:car-battery"}, "AgingMode": {"icon": "mdi:timer-sand"}, "FunctionMask": {"icon": "mdi:bitwise"}, "SafetyType": {"icon": "mdi:shield-check-outline"}, "DTC": {"icon": "mdi:alert-decagram-outline"}, "SysYear": {"icon": "mdi:calendar"}, "SysMonth": {"icon": "mdi:calendar-month"}, "SysDay": {"icon": "mdi:calendar-today"}, "SysHour": {"icon": "mdi:clock-outline", "unit_of_measurement": "h"}, "SysMin": {"icon": "mdi:clock-outline", "unit_of_measurement": "min"}, "SysSec": {"icon": "mdi:clock-outline", "unit_of_measurement": "s"}, "ManufacturerInfo": {"icon": "mdi:factory"}, "ControlFWBuildNo2": {"icon": "mdi:chip"}, "ControlFWBuildNo1": {"icon": "mdi:chip"}, "ComFWBuildNo2": {"icon": "mdi:chip"}, "ComFWBuildNo1": {"icon": "mdi:chip"}, "SysWeekly": {"icon": "mdi:calendar-week"}, "ModbusVersion": {"icon": "mdi:protocol"}, "SCCComMode": {"icon": "mdi:connection"}, "ComboardVer": {"icon": "mdi:chip"}, "uwBatPieceNum": {"icon": "mdi:battery-multiple"}, "uwAC2BatVolt": {"name": "uw AC2 Bat"}, "LiProtocolType": {"icon": "mdi:protocol"}, "BLVersion2": {"icon": "mdi:chip"},
 }
-
-type numberLimits struct{ Min, Max, Step float64 }
-
-var configNumberLimits = map[string]numberLimits{"UtiOutStart": {0, 23, 1}, "UtiOutEnd": {0, 23, 1}, "UtiChargeStart": {0, 23, 1}, "UtiChargeEnd": {0, 23, 1}, "LCDLanguage": {0, 1, 1}, "MoudleH": {0, 1, 1}, "ComAddress": {1, 254, 1}, "ResetUserInfo": {0, 1, 1}, "ResetToFactory": {0, 1, 1}, "MaxChargeAmps": {0, 180, 1}, "BulkChargeVolt": {50, 64, .1}, "FloatChargeVolt": {50, 56, .1}, "ACChargeAmps": {0, 80, 1}, "SysYear": {2000, 2099, 1}, "SysMonth": {1, 12, 1}, "SysDay": {1, 31, 1}, "SysHour": {0, 23, 1}, "SysMin": {0, 59, 1}, "SysSec": {0, 59, 1}, "SysWeekly": {0, 6, 1}, "LiProtocolType": {1, 99, 1}}
 
 func sensorMetadata(key string) map[string]any {
 	out := map[string]any{}
@@ -357,10 +394,10 @@ func (m *MQTTService) publishDiscoveryPayload(component, objectID string, p map[
 		slog.Error("failed to encode discovery payload", "error", e)
 		return
 	}
-	m.client.Publish(fmt.Sprintf("%s/%s/%s/%s/config", m.config.DiscoveryPrefix, component, m.config.DeviceID, objectID), string(b), true)
+	m.publish(fmt.Sprintf("%s/%s/%s/%s/config", m.config.DiscoveryPrefix, component, m.config.DeviceID, objectID), string(b), true)
 }
 func (m *MQTTService) clearDiscoveryPayload(component, objectID string) {
-	m.client.Publish(fmt.Sprintf("%s/%s/%s/%s/config", m.config.DiscoveryPrefix, component, m.config.DeviceID, objectID), "", true)
+	m.publish(fmt.Sprintf("%s/%s/%s/%s/config", m.config.DiscoveryPrefix, component, m.config.DeviceID, objectID), "", true)
 }
 
 func (m *MQTTService) publishDiscovery() {
@@ -440,19 +477,7 @@ func (m *MQTTService) numberLimits(key string) numberLimits {
 	m.mu.Lock()
 	batteryType := m.batteryType
 	m.mu.Unlock()
-	if key == "BatLowtoUti" || key == "uwAC2BatVolt" {
-		if batteryType == "Lithium" {
-			return numberLimits{5, 100, 1}
-		}
-		if batteryType != "" {
-			return numberLimits{20, 64, .1}
-		}
-		return numberLimits{5, 100, .1}
-	}
-	if v, ok := configNumberLimits[key]; ok {
-		return v
-	}
-	return numberLimits{0, 65535, 1}
+	return configLimits(key, batteryType)
 }
 func (m *MQTTService) batteryUnitMetadata() map[string]any {
 	m.mu.Lock()
@@ -495,7 +520,7 @@ func (m *MQTTService) publishInverterAvailability() {
 	if available {
 		payload = "online"
 	}
-	m.client.Publish(m.inverterAvailabilityTopic(), payload, true)
+	m.publish(m.inverterAvailabilityTopic(), payload, true)
 }
 func (m *MQTTService) PublishStatus() {
 	if !m.isConnected() {
@@ -508,11 +533,42 @@ func (m *MQTTService) PublishStatus() {
 		must(m.scheduler.Schedule(taskMQTTStatus, m.statusRetry, true))
 		return
 	}
-	m.statusRetry = statusInterval
+	m.statusRetry = m.config.StatusInterval
 	m.publishInverterAvailability()
-	for key, value := range status {
-		m.client.Publish(valueTopic(m.baseTopic(), "status", key), mqttValue(value), false)
+	now := m.scheduler.now()
+	m.mu.Lock()
+	fullSnapshot := m.lastFullStatus.IsZero() || now.Sub(m.lastFullStatus) >= statusFullSnapshotInterval
+	generation := m.statusGeneration
+	previous := make(map[string]string, len(m.lastStatus))
+	for key, value := range m.lastStatus {
+		previous[key] = value
 	}
+	m.mu.Unlock()
+	allPublished := true
+	published := make(map[string]string)
+	for key, value := range status {
+		payload := mqttValue(value)
+		if !fullSnapshot && previous[key] == payload {
+			continue
+		}
+		if m.publish(valueTopic(m.baseTopic(), "status", key), payload, false) {
+			published[key] = payload
+		} else {
+			allPublished = false
+		}
+	}
+	m.mu.Lock()
+	if generation != m.statusGeneration {
+		m.mu.Unlock()
+		return
+	}
+	for key, value := range published {
+		m.lastStatus[key] = value
+	}
+	if fullSnapshot && allPublished {
+		m.lastFullStatus = now
+	}
+	m.mu.Unlock()
 }
 func (m *MQTTService) PublishConfig() {
 	if !m.isConnected() {
@@ -529,7 +585,7 @@ func (m *MQTTService) PublishConfig() {
 		m.refreshBatteryDiscovery(b)
 	}
 	for key, value := range cfg {
-		m.client.Publish(valueTopic(m.baseTopic(), "config", key), mqttValue(value), true)
+		m.publish(valueTopic(m.baseTopic(), "config", key), mqttValue(value), true)
 	}
 	if m.inverter.HasPendingReadback() {
 		must(m.scheduler.Schedule(taskMQTTConfig, configVerifyRetry, false))

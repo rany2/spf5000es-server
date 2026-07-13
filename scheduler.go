@@ -9,11 +9,12 @@ import (
 )
 
 const (
-	taskWriteFlush   = "modbus_write_flush"
-	taskTimeSync     = "inverter_time_sync"
-	taskMQTTCommands = "mqtt_commands"
-	taskMQTTConfig   = "mqtt_config_publish"
-	taskMQTTStatus   = "mqtt_status_publish"
+	taskWriteFlush    = "modbus_write_flush"
+	taskTimeSync      = "inverter_time_sync"
+	taskTimezoneCheck = "timezone_check"
+	taskMQTTCommands  = "mqtt_commands"
+	taskMQTTConfig    = "mqtt_config_publish"
+	taskMQTTStatus    = "mqtt_status_publish"
 )
 
 type scheduledTask struct {

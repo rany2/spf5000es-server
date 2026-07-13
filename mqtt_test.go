@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -15,13 +16,19 @@ type publishedMessage struct {
 type fakeMQTT struct {
 	published     []publishedMessage
 	subscriptions []string
+	publishErr    error
+	subscribeErr  error
 }
 
-func (f *fakeMQTT) Publish(t string, p any, r bool) {
+func (f *fakeMQTT) Publish(t string, p any, r bool) error {
 	f.published = append(f.published, publishedMessage{t, p, r})
+	return f.publishErr
 }
-func (f *fakeMQTT) Subscribe(t string) { f.subscriptions = append(f.subscriptions, t) }
-func (f *fakeMQTT) Disconnect()        {}
+func (f *fakeMQTT) Subscribe(t string) error {
+	f.subscriptions = append(f.subscriptions, t)
+	return f.subscribeErr
+}
+func (f *fakeMQTT) Disconnect() {}
 func mqttTestService() (*MQTTService, *fakeMQTT) {
 	i, s, _, _ := testInverter(0)
 	cfg := MQTTConfig{Host: "localhost", Port: 1883, ClientID: "test", Keepalive: time.Minute, TopicPrefix: "growatt/spf5000es", DiscoveryPrefix: "homeassistant", DeviceID: "growatt_spf5000es", DeviceName: "Growatt SPF 5000 ES", ConfigInterval: 5 * time.Minute}
@@ -117,5 +124,36 @@ func TestCommandOptimisticEcho(t *testing.T) {
 	msg := findPublished(t, f, "growatt/spf5000es/config/max_charge_amps/state")
 	if msg.payload != "30" || !msg.retain {
 		t.Fatalf("message=%+v", msg)
+	}
+}
+
+func TestPublishFailureIsReported(t *testing.T) {
+	m, f := mqttTestService()
+	f.publishErr = errors.New("broker unavailable")
+	if m.publish("test/topic", "value", false) {
+		t.Fatal("failed publish reported success")
+	}
+}
+
+func TestStatusPublishesDeltasAndPeriodicSnapshot(t *testing.T) {
+	m, f := mqttTestService()
+	m.mu.Lock()
+	m.connected = true
+	m.mu.Unlock()
+	m.PublishStatus()
+	firstCount := len(f.published)
+	if firstCount == 0 {
+		t.Fatal("initial snapshot was not published")
+	}
+	m.PublishStatus()
+	if len(f.published) != firstCount {
+		t.Fatalf("unchanged status added %d messages", len(f.published)-firstCount)
+	}
+	m.mu.Lock()
+	m.lastFullStatus = m.lastFullStatus.Add(-statusFullSnapshotInterval)
+	m.mu.Unlock()
+	m.PublishStatus()
+	if len(f.published) <= firstCount {
+		t.Fatal("periodic full snapshot was not published")
 	}
 }

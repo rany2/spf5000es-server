@@ -24,6 +24,56 @@ type registerDef struct {
 	Encode        func(any) (any, error)
 }
 
+type numberLimits struct{ Min, Max, Step float64 }
+
+var configNumberLimits = map[string]numberLimits{
+	"UtiOutStart": {0, 23, 1}, "UtiOutEnd": {0, 23, 1}, "UtiChargeStart": {0, 23, 1}, "UtiChargeEnd": {0, 23, 1},
+	"LCDLanguage": {0, 1, 1}, "MoudleH": {0, 1, 1}, "ComAddress": {1, 254, 1}, "ResetUserInfo": {0, 1, 1},
+	"ResetToFactory": {0, 1, 1}, "MaxChargeAmps": {0, 180, 1}, "BulkChargeVolt": {50, 64, .1},
+	"FloatChargeVolt": {50, 56, .1}, "ACChargeAmps": {0, 80, 1}, "SysYear": {2000, 2099, 1},
+	"SysMonth": {1, 12, 1}, "SysDay": {1, 31, 1}, "SysHour": {0, 23, 1}, "SysMin": {0, 59, 1},
+	"SysSec": {0, 59, 1}, "SysWeekly": {0, 6, 1}, "LiProtocolType": {1, 99, 1},
+}
+
+func configLimits(key, batteryType string) numberLimits {
+	if key == "BatLowtoUti" || key == "uwAC2BatVolt" {
+		switch batteryType {
+		case "Lithium":
+			return numberLimits{5, 100, 1}
+		case "":
+			return numberLimits{5, 100, .1}
+		default:
+			return numberLimits{20, 64, .1}
+		}
+	}
+	if limits, ok := configNumberLimits[key]; ok {
+		return limits
+	}
+	return numberLimits{0, 65535, 1}
+}
+
+func validateConfigValue(key string, value any, def registerDef, batteryType string) error {
+	if def.Kind == regChar {
+		return nil
+	}
+	f, err := number(value)
+	if err != nil {
+		// Enum, boolean, and text encoders validate their own non-numeric inputs.
+		return nil
+	}
+	limits := configLimits(key, batteryType)
+	if f < limits.Min || f > limits.Max {
+		return fmt.Errorf("value must be between %g and %g", limits.Min, limits.Max)
+	}
+	if limits.Step > 0 {
+		steps := (f - limits.Min) / limits.Step
+		if math.Abs(steps-math.Round(steps)) > 1e-6 {
+			return fmt.Errorf("value must use increments of %g", limits.Step)
+		}
+	}
+	return nil
+}
+
 func identity(v any) (any, error) { return v, nil }
 func asInt(v any) (any, error) {
 	switch x := v.(type) {
