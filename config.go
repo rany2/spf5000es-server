@@ -133,11 +133,11 @@ func ReadAppConfig(path string) (AppConfig, error) {
 	if e != nil {
 		return AppConfig{}, e
 	}
-	ci, e := floatv("MQTT", "CONFIG_INTERVAL_SEC", 1800)
+	ci, e := floatv("MQTT", "CONFIG_INTERVAL_SEC", 300)
 	if e != nil {
 		return AppConfig{}, e
 	}
-	si, e := floatv("MQTT", "STATUS_INTERVAL_SEC", 1)
+	si, e := floatv("MQTT", "STATUS_INTERVAL_SEC", .25)
 	if e != nil {
 		return AppConfig{}, e
 	}

@@ -22,6 +22,5 @@ TOPIC_PREFIX = growatt/spf5000es
 DISCOVERY_PREFIX = homeassistant
 DEVICE_ID = growatt_spf5000es
 DEVICE_NAME = Growatt SPF 5000 ES
-CONFIG_INTERVAL_SEC = 1800
-; Poll status at this interval. Unchanged values are refreshed every minute.
-STATUS_INTERVAL_SEC = 1
+CONFIG_INTERVAL_SEC = 300
+STATUS_INTERVAL_SEC = 0.25

@@ -40,7 +40,7 @@ func run(ctx context.Context) error {
 			slog.Error("failed to close inverter", "error", e)
 		}
 	}()
-	slog.Info("service loop started", "port", cfg.Modbus.Port, "mqtt_host", cfg.MQTT.Host, "mqtt_port", cfg.MQTT.Port)
+	slog.Info("service loop started", "port", cfg.Modbus.Port, "mqtt_host", cfg.MQTT.Host, "mqtt_port", cfg.MQTT.Port, "status_interval", cfg.MQTT.StatusInterval, "config_interval", cfg.MQTT.ConfigInterval)
 	for {
 		select {
 		case <-ctx.Done():

@@ -15,7 +15,7 @@ import (
 )
 
 const (
-	statusInterval               = time.Second
+	defaultStatusInterval        = 250 * time.Millisecond
 	statusFullSnapshotInterval   = time.Minute
 	statusFailureBackoffMax      = 30 * time.Second
 	configFailureRetry           = 30 * time.Second
@@ -68,7 +68,7 @@ type MQTTService struct {
 
 func NewMQTTService(inv inverterAPI, cfg MQTTConfig, s *Scheduler) *MQTTService {
 	if cfg.StatusInterval <= 0 {
-		cfg.StatusInterval = statusInterval
+		cfg.StatusInterval = defaultStatusInterval
 	}
 	m := &MQTTService{inverter: inv, config: cfg, scheduler: s, statusRetry: cfg.StatusInterval, lastStatus: make(map[string]string), slugToKey: make(map[string]string)}
 	for key := range holdingRegisters {

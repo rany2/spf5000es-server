@@ -17,7 +17,7 @@ func TestLegacyConfigFallbacks(t *testing.T) {
 	if e != nil {
 		t.Fatal(e)
 	}
-	if c.Modbus.Timeout != 1500*time.Millisecond || c.Modbus.Retries != 2 || c.MQTT.TopicPrefix != "growatt_spf5000es" || c.MQTT.ConfigInterval != 30*time.Minute || c.MQTT.StatusInterval != time.Second {
+	if c.Modbus.Timeout != 1500*time.Millisecond || c.Modbus.Retries != 2 || c.MQTT.TopicPrefix != "growatt_spf5000es" || c.MQTT.ConfigInterval != 5*time.Minute || c.MQTT.StatusInterval != 250*time.Millisecond {
 		t.Fatalf("unexpected fallbacks: %+v", c)
 	}
 }
