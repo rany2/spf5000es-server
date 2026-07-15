@@ -12,6 +12,7 @@ const (
 	configWriteSettleDelay = time.Second
 	timeSyncInterval       = 12 * time.Minute
 	timezoneCheckInterval  = time.Second
+	clockJumpTolerance     = time.Second
 	readbackGrace          = 10 * time.Second
 )
 
@@ -36,14 +37,18 @@ type Inverter struct {
 	batteryType             string
 	consecutiveReadFailures int
 	now                     func() time.Time
+	monotonicNow            func() time.Duration
 	sleep                   func(time.Duration)
 	timezoneName            string
 	timezoneOffset          int
 	timezoneKnown           bool
+	lastWallTime            time.Time
+	lastMonotonicTime       time.Duration
 }
 
 func NewInverter(cfg ModbusConfig, s *Scheduler) *Inverter {
-	i := &Inverter{client: NewModbusClient(cfg), scheduler: s, writeBatchDelay: max(time.Duration(0), cfg.WriteBatchDelay), writeQueueSize: max(1, cfg.WriteQueueSize), pending: make(map[string]pendingReadback), now: time.Now, sleep: time.Sleep}
+	monotonicStart := time.Now()
+	i := &Inverter{client: NewModbusClient(cfg), scheduler: s, writeBatchDelay: max(time.Duration(0), cfg.WriteBatchDelay), writeQueueSize: max(1, cfg.WriteQueueSize), pending: make(map[string]pendingReadback), now: time.Now, monotonicNow: func() time.Duration { return time.Since(monotonicStart) }, sleep: time.Sleep}
 	must(s.Register(taskWriteFlush, i.FlushPendingWrites, 0, 10))
 	must(s.Register(taskTimezoneCheck, i.CheckTimezone, timezoneCheckInterval, 80))
 	must(s.Register(taskTimeSync, i.SyncTime, 0, 90))
@@ -76,6 +81,8 @@ func (i *Inverter) SyncTime() {
 	}
 	i.timezoneName, i.timezoneOffset = now.Zone()
 	i.timezoneKnown = true
+	i.lastWallTime = now
+	i.lastMonotonicTime = i.monotonicNow()
 	values := []uint16{uint16(now.Year()), uint16(now.Month()), uint16(now.Day()), uint16(now.Hour()), uint16(now.Minute()), uint16(now.Second())}
 	if err := i.client.WriteRegisters(45, values); err != nil {
 		slog.Error("failed to update inverter time", "error", err)
@@ -86,37 +93,57 @@ func (i *Inverter) SyncTime() {
 
 func (i *Inverter) rememberTimezone(now time.Time) {
 	name, offset := now.Zone()
+	monotonicNow := i.monotonicNow()
 	i.mu.Lock()
 	i.timezoneName = name
 	i.timezoneOffset = offset
 	i.timezoneKnown = true
+	i.lastWallTime = now
+	i.lastMonotonicTime = monotonicNow
 	i.mu.Unlock()
 }
 
 // CheckTimezone immediately synchronizes the inverter when the local timezone
-// name or UTC offset changes, including daylight-saving transitions.
+// changes or the wall clock jumps relative to monotonic time.
 func (i *Inverter) CheckTimezone() {
 	now := i.now()
+	monotonicNow := i.monotonicNow()
 	name, offset := now.Zone()
 	i.mu.Lock()
 	if !i.timezoneKnown {
 		i.timezoneName = name
 		i.timezoneOffset = offset
 		i.timezoneKnown = true
+		i.lastWallTime = now
+		i.lastMonotonicTime = monotonicNow
 		i.mu.Unlock()
 		return
 	}
 	oldName, oldOffset := i.timezoneName, i.timezoneOffset
-	changed := name != oldName || offset != oldOffset
-	if changed {
+	timezoneChanged := name != oldName || offset != oldOffset
+	clockJumped := false
+	var jump time.Duration
+	if !i.lastWallTime.IsZero() {
+		wallElapsed := now.Round(0).Sub(i.lastWallTime.Round(0))
+		monotonicElapsed := monotonicNow - i.lastMonotonicTime
+		jump = wallElapsed - monotonicElapsed
+		clockJumped = jump >= clockJumpTolerance || jump <= -clockJumpTolerance
+	}
+	if timezoneChanged {
 		i.timezoneName = name
 		i.timezoneOffset = offset
 	}
+	i.lastWallTime = now
+	i.lastMonotonicTime = monotonicNow
 	i.mu.Unlock()
-	if !changed {
+	if !timezoneChanged && !clockJumped {
 		return
 	}
-	slog.Info("local timezone changed; syncing inverter time", "old_zone", oldName, "new_zone", name, "old_offset", oldOffset, "new_offset", offset)
+	if timezoneChanged {
+		slog.Info("local timezone changed; syncing inverter time", "old_zone", oldName, "new_zone", name, "old_offset", oldOffset, "new_offset", offset)
+	} else {
+		slog.Info("local clock jumped; syncing inverter time", "jump", jump)
+	}
 	i.SyncTime()
 }
 

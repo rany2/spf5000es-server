@@ -6,10 +6,17 @@ import (
 	"time"
 )
 
-type fakeClock struct{ now time.Time }
+type fakeClock struct {
+	now       time.Time
+	monotonic time.Duration
+}
 
-func (c *fakeClock) Now() time.Time          { return c.now }
-func (c *fakeClock) Advance(d time.Duration) { c.now = c.now.Add(d) }
+func (c *fakeClock) Now() time.Time              { return c.now }
+func (c *fakeClock) MonotonicNow() time.Duration { return c.monotonic }
+func (c *fakeClock) Advance(d time.Duration) {
+	c.now = c.now.Add(d)
+	c.monotonic += d
+}
 
 func TestSchedulerPriorityAndPeriodicReschedule(t *testing.T) {
 	c := &fakeClock{now: time.Unix(100, 0)}

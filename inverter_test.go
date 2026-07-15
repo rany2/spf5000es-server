@@ -56,6 +56,7 @@ func testInverter(delay time.Duration) (*Inverter, *Scheduler, *fakeClock, *fake
 	cfg := ModbusConfig{Port: "/dev/null", WriteQueueSize: 128, WriteBatchDelay: delay, Timeout: time.Second}
 	i := NewInverter(cfg, s)
 	i.now = c.Now
+	i.monotonicNow = c.MonotonicNow
 	f := &fakeInverterModbus{holding: make(map[int]uint16)}
 	i.client = f
 	return i, s, c, f
@@ -172,6 +173,49 @@ func TestUnchangedTimezoneDoesNotSync(t *testing.T) {
 	i.CheckTimezone()
 	if len(modbus.writes) != 0 {
 		t.Fatalf("unchanged timezone caused writes: %v", modbus.writes)
+	}
+}
+
+func TestClockJumpTriggersImmediateSync(t *testing.T) {
+	for _, test := range []struct {
+		name string
+		jump time.Duration
+	}{
+		{"forward", 5 * time.Minute},
+		{"backward", -5 * time.Minute},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			i, s, monotonicClock, modbus := testInverter(0)
+			wallClock := &fakeClock{now: time.Date(2026, 1, 1, 12, 0, 0, 250_000_000, time.FixedZone("EET", 2*60*60))}
+			i.now = wallClock.Now
+			i.sleep = wallClock.Advance
+			i.rememberTimezone(wallClock.now)
+
+			monotonicClock.Advance(timezoneCheckInterval)
+			wallClock.Advance(timezoneCheckInterval + test.jump)
+			must(s.Schedule(taskTimezoneCheck, 0, true))
+			s.RunPending()
+
+			if len(modbus.writes) != 1 || modbus.writes[0].start != 45 {
+				t.Fatalf("clock jump writes = %v", modbus.writes)
+			}
+		})
+	}
+}
+
+func TestDelayedTimezoneCheckDoesNotLookLikeClockJump(t *testing.T) {
+	i, _, monotonicClock, modbus := testInverter(0)
+	wallClock := &fakeClock{now: time.Date(2026, 1, 1, 12, 0, 0, 0, time.FixedZone("EET", 2*60*60))}
+	i.now = wallClock.Now
+	i.rememberTimezone(wallClock.now)
+
+	delay := 30 * time.Second
+	monotonicClock.Advance(delay)
+	wallClock.Advance(delay)
+	i.CheckTimezone()
+
+	if len(modbus.writes) != 0 {
+		t.Fatalf("delayed check caused writes: %v", modbus.writes)
 	}
 }
 
