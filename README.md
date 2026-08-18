@@ -6,7 +6,7 @@ MQTT discovery and accepts supported configuration commands through MQTT.
 
 ## Requirements
 
-- Go 1.26.5 or newer
+- Go 1.26.6 or newer
 - A Growatt SPF 5000 ES connected through a serial/USB device
 - An MQTT broker
 - Linux with systemd, polkit, `usbreset`, and the `dialout` group for service installation
