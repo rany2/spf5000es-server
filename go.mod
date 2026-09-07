@@ -4,7 +4,7 @@ go 1.26.6
 
 require (
 	github.com/eclipse/paho.golang v0.23.0
-	github.com/grid-x/modbus v0.0.0-20260701064235-82e41c9acfb6
+	github.com/grid-x/modbus v1.5.1
 	gopkg.in/ini.v1 v1.67.3
 )
 
